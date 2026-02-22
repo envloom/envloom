@@ -1,6 +1,6 @@
 [package]
 name = "envloom"
-version = "0.1.0"
+version = "0.1.1"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -26,3 +26,4 @@ reqwest = { version = "0.12", features = ["blocking", "rustls-tls"] }
 sha2 = "0.10"
 rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
 chrono = { version = "0.4", default-features = true }
+zip = { version = "2", default-features = false, features = ["deflate"] }

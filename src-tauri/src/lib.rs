@@ -16,8 +16,11 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, Manager};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 mod domain;
 mod infrastructure;
+use zip::ZipArchive;
 
 use crate::domain::models::*;
 use crate::infrastructure::logging::append_runtime_log;
@@ -34,6 +37,8 @@ const RUNTIME_UPDATE_CHECK_INTERVAL_SECONDS: u64 = 3_600;
 const NGINX_RELEASES_URL: &str = "https://api.github.com/repos/nginx/nginx/releases";
 const MARIADB_RELEASES_URL: &str = "https://downloads.mariadb.org/rest-api/mariadb/";
 static SHUTDOWN_STOP_TRIGGERED: AtomicBool = AtomicBool::new(false);
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 fn envloom_global_config_path() -> PathBuf {
     let home = std::env::var_os("USERPROFILE")
@@ -434,8 +439,11 @@ fn is_version_gt(a: &str, b: &str) -> bool {
 }
 
 fn run_powershell(script: &str) -> Result<String, String> {
-    let output = Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+    let mut cmd = Command::new("powershell");
+    cmd.args(["-NoProfile", "-NonInteractive", "-Command", script]);
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let output = cmd
         .output()
         .map_err(|e| format!("failed to execute powershell: {e}"))?;
 
@@ -448,6 +456,89 @@ fn run_powershell(script: &str) -> Result<String, String> {
         ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn extract_zip_file(zip_path: &Path, destination: &Path) -> Result<(), String> {
+    fs::create_dir_all(destination).map_err(|e| format!("failed to create extract dir: {e}"))?;
+    let file = File::open(zip_path).map_err(|e| format!("failed to open zip: {e}"))?;
+    let mut archive = ZipArchive::new(file).map_err(|e| format!("failed to read zip archive: {e}"))?;
+
+    for i in 0..archive.len() {
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| format!("failed to read zip entry #{i}: {e}"))?;
+        let Some(name) = entry.enclosed_name().map(|p| p.to_path_buf()) else {
+            continue;
+        };
+        let out_path = destination.join(name);
+        if entry.is_dir() {
+            fs::create_dir_all(&out_path).map_err(|e| format!("failed to create dir from zip: {e}"))?;
+            continue;
+        }
+        if let Some(parent) = out_path.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("failed to create zip parent dir: {e}"))?;
+        }
+        let mut out = File::create(&out_path).map_err(|e| format!("failed to create extracted file: {e}"))?;
+        std::io::copy(&mut entry, &mut out).map_err(|e| format!("failed to extract zip entry: {e}"))?;
+    }
+    Ok(())
+}
+
+fn latest_nvm_windows_setup_asset() -> Result<(String, String), String> {
+    let raw = get_json_with_user_agent(
+        "https://api.github.com/repos/coreybutler/nvm-windows/releases/latest",
+        "Envloom/0.1.0",
+    )?;
+    let value: Value = serde_json::from_str(&raw).map_err(|e| format!("failed to parse nvm release json: {e}"))?;
+    let version = value
+        .get("tag_name")
+        .and_then(Value::as_str)
+        .unwrap_or("latest")
+        .to_string();
+    let assets = value
+        .get("assets")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "nvm latest release has no assets".to_string())?;
+    for asset in assets {
+        let name = asset.get("name").and_then(Value::as_str).unwrap_or("").to_lowercase();
+        if name == "nvm-setup.exe" {
+            let url = asset
+                .get("browser_download_url")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "nvm setup asset missing browser_download_url".to_string())?;
+            return Ok((version, url.to_string()));
+        }
+    }
+    Err("nvm-setup.exe not found in latest nvm-windows release".to_string())
+}
+
+fn install_nvm_windows_silently(bin_root: &Path) -> Result<String, String> {
+    let (version, url) = latest_nvm_windows_setup_asset()?;
+    let downloads = shared_downloads_dir(bin_root);
+    fs::create_dir_all(&downloads).map_err(|e| format!("failed to create downloads dir: {e}"))?;
+    let installer_path = downloads.join("nvm-setup.exe");
+    if installer_path.exists() {
+        let _ = fs::remove_file(&installer_path);
+    }
+    download_with_progress(&url, &installer_path, |_| {})?;
+
+    let mut cmd = Command::new(&installer_path);
+    cmd.args(["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-"]);
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let output = cmd
+        .output()
+        .map_err(|e| format!("failed to execute nvm installer: {e}"))?;
+    let _ = fs::remove_file(&installer_path);
+    if !output.status.success() {
+        let code = output.status.code().unwrap_or(-1);
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(format!(
+            "nvm installer failed (exit {code}). stdout: {stdout}. stderr: {stderr}"
+        ));
+    }
+    Ok(version)
 }
 
 fn detect_framework_from_path(path: &Path) -> (String, bool) {
@@ -1478,12 +1569,7 @@ fn install_latest_nginx_with_progress<F: FnMut(f64)>(bin_root: &Path, mut progre
     download_with_progress(&url, &zip_path, &mut progress)?;
     ensure_zip_signature(&zip_path)?;
     let extract_result = (|| -> Result<(), String> {
-        let extract_script = format!(
-            "Expand-Archive -LiteralPath '{}' -DestinationPath '{}' -Force",
-            ps_quote(&zip_path.to_string_lossy()),
-            ps_quote(&line_dir.to_string_lossy())
-        );
-        run_powershell(&extract_script)?;
+        extract_zip_file(&zip_path, &line_dir)?;
         flatten_nested_dir(&line_dir, &format!("nginx-{version}"))?;
         Ok(())
     })();
@@ -1727,12 +1813,7 @@ fn install_mariadb_line_build_with_progress<F: FnMut(f64)>(
         verify_file_sha256(&zip_path, expected_sha256)?;
     }
     let extract_result = (|| -> Result<(), String> {
-        let extract_script = format!(
-            "Expand-Archive -LiteralPath '{}' -DestinationPath '{}' -Force",
-            ps_quote(&zip_path.to_string_lossy()),
-            ps_quote(&line_dir.to_string_lossy())
-        );
-        run_powershell(&extract_script)?;
+        extract_zip_file(&zip_path, &line_dir)?;
         flatten_single_nested_dir(&line_dir)?;
         Ok(())
     })();
@@ -1770,15 +1851,7 @@ fn install_php_line_build_with_progress<F: FnMut(f64)>(
         verify_file_sha256(&zip_path, expected_sha256)?;
     }
 
-    let extract_result = (|| -> Result<(), String> {
-        let extract_script = format!(
-            "Expand-Archive -LiteralPath '{}' -DestinationPath '{}' -Force",
-            ps_quote(&zip_path.to_string_lossy()),
-            ps_quote(&line_dir.to_string_lossy())
-        );
-        run_powershell(&extract_script)?;
-        Ok(())
-    })();
+    let extract_result = extract_zip_file(&zip_path, &line_dir);
     let _ = fs::remove_file(&zip_path);
     extract_result?;
     Ok(())
@@ -4968,16 +5041,15 @@ fn bootstrap_php_and_composer(app: tauri::AppHandle) {
             },
         );
     } else {
-        let install_nvm_script = "winget install --id CoreyButler.NVMforWindows --exact --accept-package-agreements --accept-source-agreements --disable-interactivity";
-        let install_result = run_powershell(install_nvm_script);
+        let install_result = install_nvm_windows_silently(&bin_root);
         match install_result {
-            Ok(_) => emit_bootstrap_progress(
+            Ok(version) => emit_bootstrap_progress(
                 &app,
                 BootstrapProgressEvent {
                     phase: "nvm".to_string(),
                     status: "completed".to_string(),
                     percent: Some(100.0),
-                    message: "nvm-windows installed.".to_string(),
+                    message: format!("nvm-windows installed ({version})."),
                 },
             ),
             Err(error) => emit_bootstrap_progress(
