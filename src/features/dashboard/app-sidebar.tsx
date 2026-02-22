@@ -10,14 +10,8 @@ type AppSidebarProps = {
 export function AppSidebar({ currentRoute, onNavigate }: AppSidebarProps) {
   return (
     <aside className="flex h-full flex-col rounded-2xl border bg-sidebar/80 p-4 text-sidebar-foreground shadow-sm backdrop-blur">
-      <div className="flex items-center gap-3">
-        <div className="grid size-10 place-items-center rounded-xl bg-sidebar-primary text-sidebar-primary-foreground">
-          PN
-        </div>
-        <div>
-          <p className="font-semibold leading-none">Envloom</p>
-          <p className="text-xs text-muted-foreground">Local Stack Manager</p>
-        </div>
+      <div className="overflow-hidden p-0">
+        <img src="/logo.png" alt="Envloom" className="w-full object-contain" />
       </div>
       <Separator className="my-4" />
       <nav className="grid gap-1">
