@@ -77,6 +77,31 @@ pnpm tauri dev
 pnpm tauri build
 ```
 
+## Releases
+
+GitHub Actions includes:
+
+- `CI` (checks and builds on PRs/pushes)
+- `Release` (Windows Tauri build on tags `v*`)
+
+### Test the release workflow first (recommended)
+
+Use a prerelease tag (tags containing `-` are marked as prerelease automatically):
+
+```bash
+git tag v0.1.0-beta.1
+git push origin v0.1.0-beta.1
+```
+
+This creates a draft GitHub Release with Windows build artifacts.
+
+### Stable release
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
 ## Notes
 
 - Envloom manages local binaries and services, so some actions may require Administrator permissions (for example, editing the Windows hosts file).

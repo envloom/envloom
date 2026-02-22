@@ -45,6 +45,17 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Detect prerelease tag
+        id: release_meta
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          if ($tag -match "-") {
+            "prerelease=true" >> $env:GITHUB_OUTPUT
+          } else {
+            "prerelease=false" >> $env:GITHUB_OUTPUT
+          }
+
       - name: Build and upload Tauri release
         uses: tauri-apps/tauri-action@v0
         env:
@@ -54,4 +65,4 @@ jobs:
           releaseName: Envloom ${{ github.ref_name }}
           releaseBody: "Automated release build for ${{ github.ref_name }}."
           releaseDraft: true
-          prerelease: false
+          prerelease: ${{ steps.release_meta.outputs.prerelease }}
