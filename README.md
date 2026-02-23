@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./public/logo.png" alt="Envloom" width="220" />
+  <img src="./public/logo.svg" alt="Envloom" width="220" />
 </p>
 
 # Envloom
