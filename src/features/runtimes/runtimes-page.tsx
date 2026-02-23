@@ -3,7 +3,6 @@ import { Check } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Separator } from "@/components/ui/separator";
 import {
   Table,
   TableBody,
@@ -12,9 +11,11 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { RuntimePageShell, RuntimePanel, RuntimeStat } from "./runtime-layout";
 import {
   getPhpCatalog,
   installLatestPhp,
+  installOrUpdateLaravelInstaller,
   setActivePhp,
   setPhpBasePort,
   setPhpCurrentLine,
@@ -62,6 +63,7 @@ export function RuntimesPage() {
   const [savingPort, setSavingPort] = useState(false);
   const [savingIni, setSavingIni] = useState(false);
   const [savingCurrent, setSavingCurrent] = useState(false);
+  const [savingLaravelInstaller, setSavingLaravelInstaller] = useState(false);
   const [basePortInput, setBasePortInput] = useState("9000");
   const [maxUploadSizeMb, setMaxUploadSizeMb] = useState("128");
   const [memoryLimitMb, setMemoryLimitMb] = useState("512");
@@ -71,6 +73,11 @@ export function RuntimesPage() {
     const list = catalog?.runtimes ?? [];
     return [...list].sort((a, b) => Number(b.line) - Number(a.line));
   }, [catalog]);
+  const installedCount = runtimes.filter((runtime) => runtime.installedVersions.length > 0).length;
+  const updateCount = runtimes.filter((runtime) => {
+    const installed = runtime.installedVersions[0] ?? null;
+    return installed && isVersionNewer(runtime.latestVersion, installed);
+  }).length;
 
   useEffect(() => {
     void refresh();
@@ -183,16 +190,35 @@ export function RuntimesPage() {
     }
   }
 
-  return (
-    <div className="grid gap-6">
-      <div>
-        <h1 className="text-2xl font-semibold tracking-tight">PHP</h1>
-      </div>
-      <Separator />
+  async function handleInstallLaravelInstaller() {
+    setSavingLaravelInstaller(true);
+    setError("");
+    try {
+      const response = await installOrUpdateLaravelInstaller();
+      setCatalog(response);
+    } catch (err) {
+      setError(errorMessage(err, "Failed to install/update Laravel Installer."));
+    } finally {
+      setSavingLaravelInstaller(false);
+    }
+  }
 
-      <section className="grid gap-3">
-        <h2 className="text-xl font-semibold">Versions</h2>
-        <div className="overflow-hidden rounded-lg border">
+  return (
+    <RuntimePageShell
+      title="PHP"
+      subtitle="Manage PHP runtime lines, active/current selection and shared php.ini defaults used by local sites."
+      stats={
+        <>
+          <RuntimeStat label="Current Line" value={catalog?.currentLine ? `PHP ${catalog.currentLine}` : "Not set"} hint="Linked to bin/php/current." />
+          <RuntimeStat label="Installed" value={installedCount} hint="Major lines installed locally." />
+          <RuntimeStat label="Updates" value={updateCount} hint="Installed lines with a newer build available." />
+          <RuntimeStat label="Base Port" value={catalog?.basePort ?? 9000} hint="FPM ports derive from this base." />
+        </>
+      }
+    >
+      <div className="grid gap-4">
+      <RuntimePanel title="Versions" description="Install, update, set active and remove PHP major lines.">
+        <div className="overflow-hidden rounded-lg border bg-background">
           <Table>
             <TableHeader>
               <TableRow>
@@ -274,12 +300,11 @@ export function RuntimesPage() {
           </Table>
         </div>
         {error ? <p className="text-sm text-destructive">{error}</p> : null}
-      </section>
+      </RuntimePanel>
 
-      <Separator />
-
-      <section className="grid gap-2">
-        <h3 className="text-2xl font-semibold">Current Version</h3>
+      <RuntimePanel title="Current Version" description={
+        "Select which installed PHP line should be linked as `current`."
+      }>
         <p className="text-sm text-muted-foreground">
           Select which installed PHP line should be linked as `current`.
         </p>
@@ -309,15 +334,10 @@ export function RuntimesPage() {
             Active current: {catalog?.currentLine ? `PHP ${catalog.currentLine}` : "not set"}
           </span>
         </div>
-      </section>
+      </RuntimePanel>
 
-      <Separator />
-
-      <section className="grid gap-2">
-        <h3 className="text-2xl font-semibold">Max File Upload Size</h3>
-        <p className="text-sm text-muted-foreground">
-          Configure the maximum file size that PHP will accept as file uploads (in MB).
-        </p>
+      <div className="grid gap-4 lg:grid-cols-2">
+      <RuntimePanel title="Max File Upload Size" description="Maximum file size accepted by PHP uploads (MB).">
         <div className="flex items-center gap-2">
           <Input
             value={maxUploadSizeMb}
@@ -329,16 +349,9 @@ export function RuntimesPage() {
             {savingIni ? "Saving..." : "Save"}
           </Button>
         </div>
-      </section>
+      </RuntimePanel>
 
-      <Separator />
-
-      <section className="grid gap-2">
-        <h3 className="text-2xl font-semibold">Memory Limit</h3>
-        <p className="text-sm text-muted-foreground">
-          Configure the maximum amount of memory your PHP scripts may consume (in MB).
-        </p>
-        <p className="text-sm text-muted-foreground">Use `-1` for unlimited.</p>
+      <RuntimePanel title="Memory Limit" description="Maximum memory for PHP scripts. Use -1 for unlimited.">
         <div className="flex items-center gap-2">
           <Input
             value={memoryLimitMb}
@@ -350,22 +363,31 @@ export function RuntimesPage() {
             {savingIni ? "Saving..." : "Save"}
           </Button>
         </div>
-      </section>
+      </RuntimePanel>
+      </div>
 
-      <Separator />
-
-      <section className="grid gap-2">
-        <h3 className="text-2xl font-semibold">Laravel Installer</h3>
+      <div className="grid gap-4 lg:grid-cols-2">
+      <RuntimePanel title="Laravel Installer" description="Global Composer tool used to create Laravel projects.">
         <p className="text-sm text-muted-foreground">
-          You are using the latest version of the Laravel Installer (5.24.6).
+          {catalog?.laravelInstaller?.installed
+            ? `Installed${catalog.laravelInstaller.version ? ` (${catalog.laravelInstaller.version})` : ""}.`
+            : "Not installed yet."}
         </p>
-      </section>
+        <div className="flex items-center gap-2">
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => void handleInstallLaravelInstaller()}
+            disabled={savingLaravelInstaller || loading || !catalog}
+          >
+            {savingLaravelInstaller
+              ? (catalog?.laravelInstaller?.installed ? "Updating..." : "Installing...")
+              : (catalog?.laravelInstaller?.installed ? "Update" : "Install")}
+          </Button>
+        </div>
+      </RuntimePanel>
 
-      <Separator />
-
-      <section className="grid gap-2">
-        <h3 className="text-2xl font-semibold">Base Port</h3>
-        <p className="text-sm text-muted-foreground">Configure the base port that PHP should use.</p>
+      <RuntimePanel title="Base Port" description="Configure the base port used to derive FPM ports per PHP line.">
         <div className="flex flex-wrap items-center gap-2">
           <Input
             type="number"
@@ -378,7 +400,9 @@ export function RuntimesPage() {
           </Button>
           <span className="text-sm text-muted-foreground">Example: 9000 to 9074 for PHP 7.4</span>
         </div>
-      </section>
-    </div>
+      </RuntimePanel>
+      </div>
+      </div>
+    </RuntimePageShell>
   );
 }

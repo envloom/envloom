@@ -174,6 +174,7 @@ fn required_php_ini_block() -> String {
         "extension=pdo_mysql",
         "extension=pdo_pgsql",
         "extension=pdo_odbc",
+        "extension=zip",
         "extension=openssl",
         "extension=curl",
         "extension=mbstring",
@@ -351,10 +352,22 @@ fn stop_php_fpm_services(install_dir: &Path) -> Result<(), String> {
         "$root='{root}'; \
          Get-Process -Name 'php-cgi' -ErrorAction SilentlyContinue | \
          Where-Object {{ $_.ExecutablePath -and $_.ExecutablePath -like ($root + '*') }} | \
-         ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}",
+         ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}; \
+         try {{ \
+           Get-CimInstance Win32_Process -Filter \"Name='php-cgi.exe'\" -ErrorAction SilentlyContinue | \
+           Where-Object {{ ($_.ExecutablePath -and $_.ExecutablePath -like ($root + '*')) -or ($_.CommandLine -and $_.CommandLine -like ('*' + $root + '*')) }} | \
+           ForEach-Object {{ Invoke-CimMethod -InputObject $_ -MethodName Terminate -ErrorAction SilentlyContinue | Out-Null }} \
+         }} catch {{ }}; \
+         'ok'",
         root = install_root
     );
     let _ = run_powershell(&stop_script)?;
+    if is_process_running("php-cgi.exe") {
+        let _ = Command::new("taskkill").args(["/IM", "php-cgi.exe", "/F"]).output();
+    }
+    if is_process_running("php-cgi.exe") {
+        return Err("php-cgi processes did not stop cleanly".to_string());
+    }
     Ok(())
 }
 
@@ -484,10 +497,34 @@ fn extract_zip_file(zip_path: &Path, destination: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn latest_nvm_windows_setup_asset() -> Result<(String, String), String> {
+fn envloom_bin_root_from_runtime() -> PathBuf {
+    if cfg!(debug_assertions) {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("bin")
+    } else {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(Path::to_path_buf))
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("bin")
+    }
+}
+
+fn local_nvm_executable() -> PathBuf {
+    envloom_bin_root_from_runtime().join("nvm").join("nvm.exe")
+}
+
+fn local_nvm_home_dir() -> PathBuf {
+    envloom_bin_root_from_runtime().join("nvm")
+}
+
+fn local_nvm_symlink_dir() -> PathBuf {
+    envloom_bin_root_from_runtime().join("node").join("current")
+}
+
+fn latest_nvm_windows_noinstall_asset() -> Result<(String, String), String> {
     let raw = get_json_with_user_agent(
         "https://api.github.com/repos/coreybutler/nvm-windows/releases/latest",
-        "Envloom/0.1.0",
+        "Envloom/0.1.2",
     )?;
     let value: Value = serde_json::from_str(&raw).map_err(|e| format!("failed to parse nvm release json: {e}"))?;
     let version = value
@@ -501,43 +538,123 @@ fn latest_nvm_windows_setup_asset() -> Result<(String, String), String> {
         .ok_or_else(|| "nvm latest release has no assets".to_string())?;
     for asset in assets {
         let name = asset.get("name").and_then(Value::as_str).unwrap_or("").to_lowercase();
-        if name == "nvm-setup.exe" {
+        if name == "nvm-noinstall.zip" {
             let url = asset
                 .get("browser_download_url")
                 .and_then(Value::as_str)
-                .ok_or_else(|| "nvm setup asset missing browser_download_url".to_string())?;
+                .ok_or_else(|| "nvm noinstall asset missing browser_download_url".to_string())?;
             return Ok((version, url.to_string()));
         }
     }
-    Err("nvm-setup.exe not found in latest nvm-windows release".to_string())
+    Err("nvm-noinstall.zip not found in latest nvm-windows release".to_string())
 }
 
-fn install_nvm_windows_silently(bin_root: &Path) -> Result<String, String> {
-    let (version, url) = latest_nvm_windows_setup_asset()?;
+fn write_envloom_nvm_install_cmd(nvm_dir: &Path) -> Result<(), String> {
+    let content = r#"@echo off
+setlocal EnableExtensions
+:: Usage: install.cmd "C:\path\where\you\extracted\nvm"
+:: If no argument is passed, use a default path
+if "%~1"=="" (
+    set "NVM_PATH=%APPDATA%\nvm"
+) else (
+    set "NVM_PATH=%~1"
+)
+
+for %%I in ("%NVM_PATH%\..") do set "BIN_ROOT=%%~fI"
+set "NVM_HOME=%BIN_ROOT%\nvm"
+set "NODE_ROOT=%BIN_ROOT%\node"
+set "NVM_SYMLINK=%BIN_ROOT%\node\current"
+
+if not exist "%NVM_HOME%" mkdir "%NVM_HOME%"
+if not exist "%NODE_ROOT%" mkdir "%NODE_ROOT%"
+
+setx /M NVM_HOME "%NVM_HOME%"
+if errorlevel 1 exit /b 1
+setx /M NVM_SYMLINK "%NVM_SYMLINK%"
+if errorlevel 1 exit /b 1
+
+echo PATH=%PATH% > "%NVM_HOME%\PATH.txt"
+
+for /f "skip=2 tokens=2,*" %%A in ('reg query "HKLM\System\CurrentControlSet\Control\Session Manager\Environment" /v Path 2^>nul') do (
+    setx /M PATH "%%B;%%NVM_HOME%%;%%NVM_SYMLINK%%"
+    if errorlevel 1 exit /b 1
+)
+
+if exist "%SYSTEMDRIVE%\Program Files (x86)\" (
+    set SYS_ARCH=64
+) else (
+    set SYS_ARCH=32
+)
+
+(echo root: %NVM_HOME% && echo path: %NVM_SYMLINK% && echo arch: %SYS_ARCH% && echo proxy: none) > "%NVM_HOME%\settings.txt"
+if errorlevel 1 exit /b 1
+
+echo NVM installed successfully in %NVM_HOME%
+endlocal
+exit /b 0
+"#;
+    fs::create_dir_all(nvm_dir).map_err(|e| format!("failed to create nvm dir: {e}"))?;
+    fs::write(nvm_dir.join("install.cmd"), content).map_err(|e| format!("failed to write nvm install.cmd: {e}"))?;
+    let elevated = r#"@echo off
+:: Usage: install-elevated.cmd "C:\path\where\you\extracted\nvm"
+set "NVM_PATH=%~1"
+if "%NVM_PATH%"=="" set "NVM_PATH=%~dp0"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath 'cmd.exe' -ArgumentList '/c ""%~dp0install.cmd"" ""%NVM_PATH%""' -Verb RunAs -Wait"
+"#;
+    fs::write(nvm_dir.join("install-elevated.cmd"), elevated)
+        .map_err(|e| format!("failed to write nvm install-elevated.cmd: {e}"))?;
+    Ok(())
+}
+
+fn install_nvm_windows_noinstall(bin_root: &Path) -> Result<String, String> {
+    let nvm_dir = bin_root.join("nvm");
+    if nvm_dir.join("nvm.exe").exists() {
+        let _ = write_envloom_nvm_install_cmd(&nvm_dir);
+        std::env::set_var("NVM_HOME", local_nvm_home_dir());
+        std::env::set_var("NVM_SYMLINK", local_nvm_symlink_dir());
+        return Ok("existing".to_string());
+    }
+
+    let (version, url) = latest_nvm_windows_noinstall_asset()?;
     let downloads = shared_downloads_dir(bin_root);
     fs::create_dir_all(&downloads).map_err(|e| format!("failed to create downloads dir: {e}"))?;
-    let installer_path = downloads.join("nvm-setup.exe");
-    if installer_path.exists() {
-        let _ = fs::remove_file(&installer_path);
+    let zip_path = downloads.join("nvm-noinstall.zip");
+    if zip_path.exists() {
+        let _ = fs::remove_file(&zip_path);
     }
-    download_with_progress(&url, &installer_path, |_| {})?;
+    download_with_progress(&url, &zip_path, |_| {})?;
+    ensure_zip_signature(&zip_path)?;
 
-    let mut cmd = Command::new(&installer_path);
-    cmd.args(["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-"]);
+    if nvm_dir.exists() {
+        fs::remove_dir_all(&nvm_dir).map_err(|e| format!("failed to replace nvm directory: {e}"))?;
+    }
+    fs::create_dir_all(&nvm_dir).map_err(|e| format!("failed to create nvm dir: {e}"))?;
+    let extract_result = extract_zip_file(&zip_path, &nvm_dir);
+    let _ = fs::remove_file(&zip_path);
+    extract_result?;
+    write_envloom_nvm_install_cmd(&nvm_dir)?;
+
+    let mut cmd = Command::new("cmd");
+    cmd.args(["/C", "install-elevated.cmd", &nvm_dir.to_string_lossy()]);
+    cmd.current_dir(&nvm_dir);
     #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW);
     let output = cmd
         .output()
-        .map_err(|e| format!("failed to execute nvm installer: {e}"))?;
-    let _ = fs::remove_file(&installer_path);
+        .map_err(|e| format!("failed to execute nvm install-elevated.cmd: {e}"))?;
     if !output.status.success() {
         let code = output.status.code().unwrap_or(-1);
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(format!(
-            "nvm installer failed (exit {code}). stdout: {stdout}. stderr: {stderr}"
+            "nvm noinstall install-elevated.cmd failed (exit {code}). stdout: {stdout}. stderr: {stderr}"
         ));
     }
+    if !nvm_dir.join("nvm.exe").exists() || !local_nvm_home_dir().join("settings.txt").exists() {
+        return Err("nvm noinstall files extracted but install did not complete (missing settings.txt or nvm.exe). UAC may have been denied.".to_string());
+    }
+    std::env::set_var("NVM_HOME", local_nvm_home_dir());
+    std::env::set_var("NVM_SYMLINK", local_nvm_symlink_dir());
     Ok(version)
 }
 
@@ -599,6 +716,8 @@ fn run_command_capture(
     if let Some(dir) = working_dir {
         command.current_dir(dir);
     }
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
     let output = command
         .output()
         .map_err(|e| format!("failed to execute {}: {e}", executable.to_string_lossy()))?;
@@ -655,14 +774,117 @@ fn normalize_starter_kit(value: Option<&str>) -> Option<String> {
     Some(raw)
 }
 
-fn starter_repo_url(value: &str) -> Option<&'static str> {
+fn starter_repo_name(value: &str) -> Option<&'static str> {
     match value {
-        "react" => Some("https://github.com/laravel/react-starter-kit.git"),
-        "vue" => Some("https://github.com/laravel/vue-starter-kit.git"),
-        "svelte" => Some("https://github.com/laravel/svelte-starter-kit.git"),
-        "livewire" => Some("https://github.com/laravel/livewire-starter-kit.git"),
+        "react" => Some("laravel/react-starter-kit"),
+        "vue" => Some("laravel/vue-starter-kit"),
+        "svelte" => Some("laravel/svelte-starter-kit"),
+        "livewire" => Some("laravel/livewire-starter-kit"),
         _ => None,
     }
+}
+
+fn latest_github_release_zipball(repo: &str) -> Result<(String, String), String> {
+    let url = format!("https://api.github.com/repos/{repo}/releases/latest");
+    let raw = get_json_with_user_agent(&url, "Envloom/0.1.1")?;
+    let value: Value =
+        serde_json::from_str(&raw).map_err(|e| format!("failed to parse github release json for {repo}: {e}"))?;
+    let tag = value
+        .get("tag_name")
+        .and_then(Value::as_str)
+        .unwrap_or("latest")
+        .to_string();
+    let zipball_url = value
+        .get("zipball_url")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("latest release for {repo} has no zipball_url"))?
+        .to_string();
+    Ok((tag, zipball_url))
+}
+
+fn move_dir_contents(src_dir: &Path, dst_dir: &Path) -> Result<(), String> {
+    fs::create_dir_all(dst_dir).map_err(|e| format!("failed to create destination directory: {e}"))?;
+    let entries = fs::read_dir(src_dir).map_err(|e| format!("failed to read extracted directory: {e}"))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("failed reading extracted entry: {e}"))?;
+        let src = entry.path();
+        let dst = dst_dir.join(entry.file_name());
+        if dst.exists() {
+            if dst.is_dir() {
+                fs::remove_dir_all(&dst).map_err(|e| format!("failed to replace extracted dir: {e}"))?;
+            } else {
+                fs::remove_file(&dst).map_err(|e| format!("failed to replace extracted file: {e}"))?;
+            }
+        }
+        fs::rename(&src, &dst).map_err(|e| format!("failed to move extracted entry: {e}"))?;
+    }
+    Ok(())
+}
+
+fn provision_starter_kit_from_release(
+    app: &tauri::AppHandle,
+    bin_root: &Path,
+    repo: &str,
+    project_path: &Path,
+) -> Result<(), String> {
+    let (tag, zip_url) = latest_github_release_zipball(repo)?;
+    emit_site_provision_output(app, &format!("Action: downloading starter release {repo}@{tag}"));
+
+    let downloads_dir = shared_downloads_dir(bin_root);
+    fs::create_dir_all(&downloads_dir).map_err(|e| format!("failed to create shared downloads dir: {e}"))?;
+    let zip_name = format!(
+        "{}-{}.zip",
+        repo.split('/').last().unwrap_or("starter"),
+        tag.replace(['/', '\\', ':'], "-")
+    );
+    let zip_path = downloads_dir.join(zip_name);
+    if zip_path.exists() {
+        let _ = fs::remove_file(&zip_path);
+    }
+    download_with_progress(&zip_url, &zip_path, |_| {})?;
+    ensure_zip_signature(&zip_path)?;
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_secs())
+        .unwrap_or(0);
+    let extract_root = downloads_dir.join(format!("starter_extract_{now}"));
+    if extract_root.exists() {
+        let _ = fs::remove_dir_all(&extract_root);
+    }
+    fs::create_dir_all(&extract_root).map_err(|e| format!("failed to create extraction dir: {e}"))?;
+
+    let extract_result = (|| -> Result<(), String> {
+        extract_zip_file(&zip_path, &extract_root)?;
+        let mut dirs = vec![];
+        let mut files = vec![];
+        for entry in fs::read_dir(&extract_root).map_err(|e| format!("failed reading extraction root: {e}"))? {
+            let entry = entry.map_err(|e| format!("failed reading extraction root entry: {e}"))?;
+            let path = entry.path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else {
+                files.push(path);
+            }
+        }
+
+        if !files.is_empty() {
+            move_dir_contents(&extract_root, project_path)?;
+            return Ok(());
+        }
+
+        let root_dir = if dirs.len() == 1 {
+            dirs.remove(0)
+        } else {
+            return Err("unexpected starter kit archive structure".to_string());
+        };
+        move_dir_contents(&root_dir, project_path)?;
+        Ok(())
+    })();
+
+    let _ = fs::remove_file(&zip_path);
+    let _ = fs::remove_dir_all(&extract_root);
+    extract_result
 }
 
 fn ensure_env_file(project_path: &Path) -> Result<bool, String> {
@@ -734,17 +956,10 @@ fn provision_new_laravel_site(
 
     let starter = normalize_starter_kit(starter_kit);
     if let Some(ref starter_value) = starter {
-        let Some(repo_url) = starter_repo_url(starter_value) else {
+        let Some(repo_name) = starter_repo_name(starter_value) else {
             return Err(format!("unsupported starter kit: {starter_value}"));
         };
-        let clone_args = vec![
-            "clone".to_string(),
-            "--depth".to_string(),
-            "1".to_string(),
-            repo_url.to_string(),
-            project_path.to_string_lossy().to_string(),
-        ];
-        let _ = run_command_capture_report(app, "git.clone", Path::new("git"), &clone_args, Some(parent))?;
+        provision_starter_kit_from_release(app, &bin_root, repo_name, project_path)?;
     } else {
         let create_args = vec![
             composer_phar.to_string_lossy().to_string(),
@@ -841,6 +1056,29 @@ fn provision_new_laravel_site(
 }
 
 fn run_nvm_command(args: &[&str]) -> Result<String, String> {
+    let local_nvm = local_nvm_executable();
+    if local_nvm.exists() {
+        let mut cmd = Command::new(local_nvm);
+        cmd.args(args);
+        cmd.env("NVM_HOME", local_nvm_home_dir());
+        cmd.env("NVM_SYMLINK", local_nvm_symlink_dir());
+        #[cfg(windows)]
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        let output = cmd.output().map_err(|e| format!("failed to execute nvm: {e}"))?;
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if !output.status.success() {
+            let code = output.status.code().unwrap_or(-1);
+            return Err(format!("nvm failed (exit {code}). stdout: {stdout}. stderr: {stderr}"));
+        }
+        return Ok(if stderr.is_empty() {
+            stdout
+        } else if stdout.is_empty() {
+            stderr
+        } else {
+            format!("{stdout}\n{stderr}")
+        });
+    }
     let joined = args.join(" ");
     let script = format!("nvm {joined}");
     run_powershell(&script)
@@ -955,12 +1193,19 @@ fn ensure_runtime_shims(bin_root: &Path) -> Result<PathBuf, String> {
         }
     }
 
-    let mariadb_shims = [("mariadb.cmd", "mariadb.exe"), ("mysql.cmd", "mysql.exe")];
-    for (shim_name, exe_name) in mariadb_shims {
-        let exe_path = bin_root.join("mariadb").join("current").join("bin").join(exe_name);
-        if !exe_path.exists() {
+    let mariadb_current_bin = bin_root.join("mariadb").join("current").join("bin");
+    let mariadb_current_shims = [
+        ("mariadb.cmd", vec!["mariadb.exe"]),
+        ("mysql.cmd", vec!["mysql.exe", "mariadb.exe"]),
+        ("mysqladmin.cmd", vec!["mysqladmin.exe", "mariadb-admin.exe"]),
+    ];
+    for (shim_name, candidates) in mariadb_current_shims {
+        let exe_name = candidates
+            .into_iter()
+            .find(|candidate| mariadb_current_bin.join(candidate).exists());
+        let Some(exe_name) = exe_name else {
             continue;
-        }
+        };
         let shim_path = shims_dir.join(shim_name);
         let shim_content = format!("@ECHO OFF\r\n\"%~dp0mariadb\\current\\bin\\{exe_name}\" %*\r\n");
         let current = fs::read_to_string(&shim_path).unwrap_or_default();
@@ -1001,11 +1246,17 @@ fn ensure_runtime_shims(bin_root: &Path) -> Result<PathBuf, String> {
                 continue;
             }
             let suffix = format!("{major}{minor}");
-            for (prefix, exe_name) in [("mysql", "mysql.exe"), ("mariadb", "mariadb.exe")] {
-                let exe_path = path.join("bin").join(exe_name);
-                if !exe_path.exists() {
+            for (prefix, candidates) in [
+                ("mysql", vec!["mysql.exe", "mariadb.exe"]),
+                ("mariadb", vec!["mariadb.exe"]),
+                ("mysqladmin", vec!["mysqladmin.exe", "mariadb-admin.exe"]),
+            ] {
+                let exe_name = candidates
+                    .into_iter()
+                    .find(|candidate| path.join("bin").join(candidate).exists());
+                let Some(exe_name) = exe_name else {
                     continue;
-                }
+                };
                 let shim_name = format!("{prefix}{suffix}.cmd");
                 let shim_path = shims_dir.join(&shim_name);
                 let shim_content = format!("@ECHO OFF\r\n\"%~dp0mariadb\\{line}\\bin\\{exe_name}\" %*\r\n");
@@ -3231,6 +3482,114 @@ fn build_php_catalog(config: &PhpConfig, latest: &HashMap<String, PhpReleaseBuil
         .collect()
 }
 
+fn detect_laravel_installer_status(php_install_dir: &Path, config: &PhpConfig) -> LaravelInstallerStatus {
+    let bin_root = php_install_dir
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| php_install_dir.to_path_buf());
+    let composer_phar = bin_root.join("composer").join("composer.phar");
+    if !composer_phar.exists() {
+        return LaravelInstallerStatus {
+            installed: false,
+            version: None,
+        };
+    }
+
+    let mut candidates: Vec<String> = vec![];
+    if let Some(current) = config.current_line.clone() {
+        candidates.push(current);
+    }
+    for line in config.installed.keys() {
+        if !candidates.iter().any(|value| value == line) {
+            candidates.push(line.clone());
+        }
+    }
+
+    for line in candidates {
+        let php_exe = php_install_dir.join(&line).join("php.exe");
+        if !php_exe.exists() {
+            continue;
+        }
+        let mut command = Command::new(&php_exe);
+        command
+            .arg(&composer_phar)
+            .arg("global")
+            .arg("show")
+            .arg("laravel/installer")
+            .arg("--format=json")
+            .arg("--no-interaction");
+        #[cfg(windows)]
+        command.creation_flags(CREATE_NO_WINDOW);
+        let output = command.output();
+        let Ok(output) = output else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if let Ok(json) = serde_json::from_str::<Value>(&stdout) {
+            let version = json
+                .get("installed")
+                .and_then(Value::as_array)
+                .and_then(|items| items.first())
+                .and_then(|item| item.get("version").and_then(Value::as_str))
+                .map(|value| value.to_string())
+                .or_else(|| {
+                    json.get("versions")
+                        .and_then(Value::as_array)
+                        .and_then(|items| items.first())
+                        .and_then(Value::as_str)
+                        .map(|value| value.to_string())
+                });
+            return LaravelInstallerStatus {
+                installed: true,
+                version,
+            };
+        }
+        return LaravelInstallerStatus {
+            installed: true,
+            version: None,
+        };
+    }
+
+    LaravelInstallerStatus {
+        installed: false,
+        version: None,
+    }
+}
+
+fn php_catalog_response(
+    install_dir: &Path,
+    config: &PhpConfig,
+    latest: &HashMap<String, PhpReleaseBuild>,
+) -> PhpCatalogResponse {
+    PhpCatalogResponse {
+        base_port: config.base_port,
+        max_upload_size_mb: config.max_upload_size_mb.clone(),
+        memory_limit_mb: config.memory_limit_mb.clone(),
+        current_line: config.current_line.clone(),
+        laravel_installer: detect_laravel_installer_status(install_dir, config),
+        runtimes: build_php_catalog(config, latest),
+    }
+}
+
+fn resolve_php_cli_for_global_composer(install_dir: &Path, config: &PhpConfig) -> Result<PathBuf, String> {
+    if let Some(current) = config.current_line.as_ref() {
+        let php_exe = install_dir.join(current).join("php.exe");
+        if php_exe.exists() {
+            return Ok(php_exe);
+        }
+    }
+    for line in config.installed.keys() {
+        let php_exe = install_dir.join(line).join("php.exe");
+        if php_exe.exists() {
+            return Ok(php_exe);
+        }
+    }
+    Err("no installed PHP runtime found. Install PHP first.".to_string())
+}
+
 #[tauri::command]
 fn list_runtimes(state: tauri::State<'_, AppState>) -> Result<Vec<RuntimeResponse>, String> {
     let guard = state
@@ -3416,6 +3775,18 @@ async fn create_site(
     }
     if node_version.is_empty() {
         return Err("node version is required".to_string());
+    }
+    let node_catalog = node_get_catalog();
+    if !node_catalog.nvm_available {
+        return Err(node_catalog
+            .error
+            .unwrap_or_else(|| "Node runtime manager is not available. Install Node runtime support first.".to_string()));
+    }
+    if node_catalog.installed_versions.is_empty() {
+        return Err(
+            "No Node version is installed yet. Install at least one Node version in Runtime > Node before creating or linking a site."
+                .to_string(),
+        );
     }
     let path_buf = PathBuf::from(&path);
     let starter_kit = normalize_starter_kit(payload.starter_kit.as_deref());
@@ -4066,13 +4437,7 @@ fn php_get_catalog(state: tauri::State<'_, AppState>) -> Result<PhpCatalogRespon
     if guard.config != before {
         save_php_config(&guard.config_path, &guard.config)?;
     }
-    Ok(PhpCatalogResponse {
-        base_port: guard.config.base_port,
-        max_upload_size_mb: guard.config.max_upload_size_mb.clone(),
-        memory_limit_mb: guard.config.memory_limit_mb.clone(),
-        current_line: guard.config.current_line.clone(),
-        runtimes: build_php_catalog(&guard.config, &latest),
-    })
+    Ok(php_catalog_response(&guard.install_dir, &guard.config, &latest))
 }
 
 #[tauri::command]
@@ -4092,13 +4457,7 @@ fn php_set_base_port(state: tauri::State<'_, AppState>, base_port: u16) -> Resul
     restart_php_fpm_services(&guard.install_dir, &guard.config)?;
     save_php_config(&guard.config_path, &guard.config)?;
     let latest = latest_builds_with_fallback(&guard.cache_path);
-    Ok(PhpCatalogResponse {
-        base_port,
-        max_upload_size_mb: guard.config.max_upload_size_mb.clone(),
-        memory_limit_mb: guard.config.memory_limit_mb.clone(),
-        current_line: guard.config.current_line.clone(),
-        runtimes: build_php_catalog(&guard.config, &latest),
-    })
+    Ok(php_catalog_response(&guard.install_dir, &guard.config, &latest))
 }
 
 #[tauri::command]
@@ -4121,6 +4480,12 @@ fn php_install_latest(state: tauri::State<'_, AppState>, line: String) -> Result
         .get(&line)
         .cloned()
         .ok_or_else(|| format!("could not find latest TS x64 build for PHP {line}"))?;
+    let had_current_before = guard
+        .config
+        .current_line
+        .as_ref()
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false);
     install_php_line_build_with_progress(&guard.install_dir, &line, &build, |_| {})?;
     let line_dir = guard.install_dir.join(&line);
     apply_php_ini_to_line(&guard.install_dir, &guard.template_dir, &line, &guard.config)?;
@@ -4134,19 +4499,17 @@ fn php_install_latest(state: tauri::State<'_, AppState>, line: String) -> Result
         .config
         .active
         .insert(line.clone(), installed_version);
-    guard.config.current_line = Some(line.clone());
-    set_php_current_link(&guard.install_dir, &line)?;
+    if !had_current_before {
+        guard.config.current_line = Some(line.clone());
+        set_php_current_link(&guard.install_dir, &line)?;
+    } else if let Some(current_line) = guard.config.current_line.clone() {
+        let _ = set_php_current_link(&guard.install_dir, &current_line);
+    }
     restart_php_fpm_services(&guard.install_dir, &guard.config)?;
     save_php_config(&guard.config_path, &guard.config)?;
     let _ = refresh_user_path_with_runtime_currents(&guard.install_dir, &mariadb_install_dir);
 
-    Ok(PhpCatalogResponse {
-        base_port: guard.config.base_port,
-        max_upload_size_mb: guard.config.max_upload_size_mb.clone(),
-        memory_limit_mb: guard.config.memory_limit_mb.clone(),
-        current_line: guard.config.current_line.clone(),
-        runtimes: build_php_catalog(&guard.config, &latest),
-    })
+    Ok(php_catalog_response(&guard.install_dir, &guard.config, &latest))
 }
 
 #[tauri::command]
@@ -4186,13 +4549,7 @@ fn php_uninstall_line(state: tauri::State<'_, AppState>, line: String) -> Result
     save_php_config(&guard.config_path, &guard.config)?;
     let _ = refresh_user_path_with_runtime_currents(&guard.install_dir, &mariadb_install_dir);
     let latest = latest_builds_with_fallback(&guard.cache_path);
-    Ok(PhpCatalogResponse {
-        base_port: guard.config.base_port,
-        max_upload_size_mb: guard.config.max_upload_size_mb.clone(),
-        memory_limit_mb: guard.config.memory_limit_mb.clone(),
-        current_line: guard.config.current_line.clone(),
-        runtimes: build_php_catalog(&guard.config, &latest),
-    })
+    Ok(php_catalog_response(&guard.install_dir, &guard.config, &latest))
 }
 
 #[tauri::command]
@@ -4224,13 +4581,7 @@ fn php_set_active(
     save_php_config(&guard.config_path, &guard.config)?;
     let _ = refresh_user_path_with_runtime_currents(&guard.install_dir, &mariadb_install_dir);
     let latest = latest_builds_with_fallback(&guard.cache_path);
-    Ok(PhpCatalogResponse {
-        base_port: guard.config.base_port,
-        max_upload_size_mb: guard.config.max_upload_size_mb.clone(),
-        memory_limit_mb: guard.config.memory_limit_mb.clone(),
-        current_line: guard.config.current_line.clone(),
-        runtimes: build_php_catalog(&guard.config, &latest),
-    })
+    Ok(php_catalog_response(&guard.install_dir, &guard.config, &latest))
 }
 
 #[tauri::command]
@@ -4264,13 +4615,7 @@ fn php_set_ini_values(
     save_php_config(&guard.config_path, &guard.config)?;
 
     let latest = latest_builds_with_fallback(&guard.cache_path);
-    Ok(PhpCatalogResponse {
-        base_port: guard.config.base_port,
-        max_upload_size_mb: guard.config.max_upload_size_mb.clone(),
-        memory_limit_mb: guard.config.memory_limit_mb.clone(),
-        current_line: guard.config.current_line.clone(),
-        runtimes: build_php_catalog(&guard.config, &latest),
-    })
+    Ok(php_catalog_response(&guard.install_dir, &guard.config, &latest))
 }
 
 #[tauri::command]
@@ -4298,13 +4643,7 @@ fn php_set_current_line(state: tauri::State<'_, AppState>, line: String) -> Resu
     save_php_config(&guard.config_path, &guard.config)?;
     let _ = refresh_user_path_with_runtime_currents(&guard.install_dir, &mariadb_install_dir);
     let latest = latest_builds_with_fallback(&guard.cache_path);
-    Ok(PhpCatalogResponse {
-        base_port: guard.config.base_port,
-        max_upload_size_mb: guard.config.max_upload_size_mb.clone(),
-        memory_limit_mb: guard.config.memory_limit_mb.clone(),
-        current_line: guard.config.current_line.clone(),
-        runtimes: build_php_catalog(&guard.config, &latest),
-    })
+    Ok(php_catalog_response(&guard.install_dir, &guard.config, &latest))
 }
 
 #[tauri::command]
@@ -4320,13 +4659,62 @@ fn php_restart_fpm(state: tauri::State<'_, AppState>) -> Result<PhpCatalogRespon
     restart_php_fpm_services(&guard.install_dir, &guard.config)?;
     save_php_config(&guard.config_path, &guard.config)?;
     let latest = latest_builds_with_fallback(&guard.cache_path);
-    Ok(PhpCatalogResponse {
-        base_port: guard.config.base_port,
-        max_upload_size_mb: guard.config.max_upload_size_mb.clone(),
-        memory_limit_mb: guard.config.memory_limit_mb.clone(),
-        current_line: guard.config.current_line.clone(),
-        runtimes: build_php_catalog(&guard.config, &latest),
-    })
+    Ok(php_catalog_response(&guard.install_dir, &guard.config, &latest))
+}
+
+#[tauri::command]
+fn php_install_laravel_installer(state: tauri::State<'_, AppState>) -> Result<PhpCatalogResponse, String> {
+    let mut guard = state
+        .php
+        .lock()
+        .map_err(|_| "failed to lock php state".to_string())?;
+    ensure_php_config_defaults(&mut guard.config);
+    let install_dir = guard.install_dir.clone();
+    sync_local_php_installations(&install_dir, &mut guard.config)?;
+
+    let bin_root = guard
+        .install_dir
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| guard.install_dir.to_path_buf());
+    let composer_phar = bin_root.join("composer").join("composer.phar");
+    if !composer_phar.exists() {
+        return Err("composer.phar is missing. Wait for bootstrap or download Composer first.".to_string());
+    }
+    let php_exe = resolve_php_cli_for_global_composer(&guard.install_dir, &guard.config)?;
+
+    let mut command = Command::new(&php_exe);
+    command
+        .arg(&composer_phar)
+        .arg("global")
+        .arg("require")
+        .arg("laravel/installer")
+        .arg("--update-with-all-dependencies")
+        .arg("--no-interaction");
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
+    let output = command
+        .output()
+        .map_err(|e| format!("failed to run composer global require laravel/installer: {e}"))?;
+
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let mut msg = format!(
+            "composer global require laravel/installer failed (exit {}).",
+            output.status.code().unwrap_or(-1)
+        );
+        if !stdout.is_empty() {
+            msg.push_str(&format!(" stdout: {stdout}"));
+        }
+        if !stderr.is_empty() {
+            msg.push_str(&format!(" stderr: {stderr}"));
+        }
+        return Err(msg);
+    }
+
+    let latest = latest_builds_with_fallback(&guard.cache_path);
+    Ok(php_catalog_response(&guard.install_dir, &guard.config, &latest))
 }
 
 #[tauri::command]
@@ -4400,13 +4788,21 @@ fn mariadb_install_latest(
         .get(&line)
         .cloned()
         .ok_or_else(|| format!("could not find latest Windows x64 build for MariaDB {line}"))?;
+    let had_current_before = guard
+        .config
+        .current_line
+        .as_ref()
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false);
     install_mariadb_line_build_with_progress(&guard.install_dir, &line, &build, |_| {})?;
     apply_mariadb_config_to_line(&guard.install_dir, &guard.template_dir, &line, &guard.config)?;
     guard
         .config
         .installed
         .insert(line.clone(), vec![build.version.clone()]);
-    guard.config.current_line = Some(line);
+    if !had_current_before {
+        guard.config.current_line = Some(line);
+    }
     if let Some(current_line) = guard.config.current_line.clone() {
         set_mariadb_current_link(&guard.install_dir, &current_line)?;
     }
@@ -4510,7 +4906,8 @@ fn node_get_catalog() -> NodeCatalogResponse {
 }
 
 #[tauri::command]
-fn node_install_major(major: String) -> Result<NodeCatalogResponse, String> {
+fn node_install_major(state: tauri::State<'_, AppState>, major: String) -> Result<NodeCatalogResponse, String> {
+    let log_path = state.log_path.clone();
     let catalog = build_node_catalog();
     if !catalog.nvm_available {
         return Err(catalog
@@ -4523,13 +4920,53 @@ fn node_install_major(major: String) -> Result<NodeCatalogResponse, String> {
         .find(|runtime| runtime.line == major)
         .and_then(|runtime| runtime.latest_version.clone())
         .ok_or_else(|| format!("no available Node version found for major {major}"))?;
-
-    run_nvm_command(&["install", &target, "64"])?;
+    let first_install = catalog.installed_versions.is_empty();
+    append_runtime_log(
+        &log_path,
+        "INFO",
+        "node.install",
+        &format!("Running: nvm install {target}"),
+    );
+    match run_nvm_command(&["install", &target]) {
+        Ok(output) => {
+            append_runtime_log(
+                &log_path,
+                "INFO",
+                "node.install",
+                &format!("nvm install output: {}", output.replace('\n', " | ")),
+            );
+        }
+        Err(error) => {
+            append_runtime_log(&log_path, "ERROR", "node.install", &error);
+            return Err(error);
+        }
+    }
+    if first_install {
+        append_runtime_log(
+            &log_path,
+            "INFO",
+            "node.install",
+            &format!("First Node install detected, running: nvm use {target}"),
+        );
+        match run_nvm_command(&["use", &target]) {
+            Ok(output) => append_runtime_log(
+                &log_path,
+                "INFO",
+                "node.install",
+                &format!("nvm use output: {}", output.replace('\n', " | ")),
+            ),
+            Err(error) => {
+                append_runtime_log(&log_path, "ERROR", "node.install", &format!("nvm use failed after install: {error}"));
+                return Err(error);
+            }
+        }
+    }
     Ok(build_node_catalog())
 }
 
 #[tauri::command]
 fn node_set_current_version(state: tauri::State<'_, AppState>, version: String) -> Result<NodeCatalogResponse, String> {
+    let log_path = state.log_path.clone();
     let catalog = build_node_catalog();
     if !catalog.nvm_available {
         return Err(catalog
@@ -4539,7 +4976,34 @@ fn node_set_current_version(state: tauri::State<'_, AppState>, version: String) 
     if !catalog.installed_versions.iter().any(|v| v == &version) {
         return Err(format!("node version {version} is not installed"));
     }
-    run_nvm_command(&["use", &version, "64"])?;
+    append_runtime_log(
+        &log_path,
+        "INFO",
+        "node.use",
+        &format!("Running: nvm use {version}"),
+    );
+    match run_nvm_command(&["use", &version]) {
+        Ok(output) => {
+            append_runtime_log(
+                &log_path,
+                "INFO",
+                "node.use",
+                &format!("nvm use output: {}", output.replace('\n', " | ")),
+            );
+        }
+        Err(error) => {
+            append_runtime_log(&log_path, "ERROR", "node.use", &error);
+            return Err(error);
+        }
+    }
+    if let Ok(current_out) = run_nvm_command(&["current"]) {
+        append_runtime_log(
+            &log_path,
+            "INFO",
+            "node.use",
+            &format!("nvm current after use: {}", current_out.replace('\n', " | ")),
+        );
+    }
     let php_install_dir = state
         .php
         .lock()
@@ -4793,7 +5257,7 @@ fn bootstrap_php_and_composer(app: tauri::AppHandle) {
             phase: "php".to_string(),
             status: "started".to_string(),
             percent: Some(0.0),
-            message: "Checking latest PHP release...".to_string(),
+            message: "Checking PHP runtime...".to_string(),
         },
     );
 
@@ -4853,7 +5317,7 @@ fn bootstrap_php_and_composer(app: tauri::AppHandle) {
                 phase: "php".to_string(),
                 status: "skipped".to_string(),
                 percent: Some(100.0),
-                message: format!("Latest PHP {} already installed.", target_version),
+                message: format!("PHP runtime already available ({target_version})."),
             },
         );
     } else {
@@ -4864,7 +5328,7 @@ fn bootstrap_php_and_composer(app: tauri::AppHandle) {
                     phase: "php".to_string(),
                     status: "progress".to_string(),
                     percent: Some(pct),
-                    message: format!("Downloading PHP {}...", target_version),
+                        message: format!("Installing PHP runtime ({target_version})..."),
                 },
             );
         });
@@ -4932,7 +5396,7 @@ fn bootstrap_php_and_composer(app: tauri::AppHandle) {
             phase: "php".to_string(),
             status: "completed".to_string(),
             percent: Some(100.0),
-            message: format!("PHP {} ready.", target_version),
+                    message: format!("PHP runtime ready ({target_version})."),
         },
     );
 
@@ -4942,7 +5406,7 @@ fn bootstrap_php_and_composer(app: tauri::AppHandle) {
             phase: "composer".to_string(),
             status: "started".to_string(),
             percent: None,
-            message: "Downloading Composer in background...".to_string(),
+            message: "Checking Composer...".to_string(),
         },
     );
 
@@ -4964,7 +5428,7 @@ fn bootstrap_php_and_composer(app: tauri::AppHandle) {
                 phase: "composer".to_string(),
                 status: "skipped".to_string(),
                 percent: Some(100.0),
-                message: "Composer already exists.".to_string(),
+                message: "Composer already available.".to_string(),
             },
         );
     } else {
@@ -4990,7 +5454,7 @@ fn bootstrap_php_and_composer(app: tauri::AppHandle) {
                             phase: "composer".to_string(),
                             status: "error".to_string(),
                             percent: None,
-                            message: format!("Composer downloaded but move failed: {error}"),
+                            message: format!("Composer setup failed: {error}"),
                         },
                     );
                     return;
@@ -5004,7 +5468,7 @@ fn bootstrap_php_and_composer(app: tauri::AppHandle) {
                     phase: "composer".to_string(),
                     status: "completed".to_string(),
                     percent: Some(100.0),
-                    message: "Composer downloaded.".to_string(),
+                    message: "Composer ready.".to_string(),
                 },
             )
             }
@@ -5026,7 +5490,7 @@ fn bootstrap_php_and_composer(app: tauri::AppHandle) {
             phase: "nvm".to_string(),
             status: "started".to_string(),
             percent: None,
-            message: "Checking nvm-windows...".to_string(),
+            message: "Checking Node runtime manager...".to_string(),
         },
     );
 
@@ -5037,11 +5501,11 @@ fn bootstrap_php_and_composer(app: tauri::AppHandle) {
                 phase: "nvm".to_string(),
                 status: "skipped".to_string(),
                 percent: Some(100.0),
-                message: "nvm-windows is already installed.".to_string(),
+                message: "Node runtime manager ready.".to_string(),
             },
         );
     } else {
-        let install_result = install_nvm_windows_silently(&bin_root);
+        let install_result = install_nvm_windows_noinstall(&bin_root);
         match install_result {
             Ok(version) => emit_bootstrap_progress(
                 &app,
@@ -5049,7 +5513,7 @@ fn bootstrap_php_and_composer(app: tauri::AppHandle) {
                     phase: "nvm".to_string(),
                     status: "completed".to_string(),
                     percent: Some(100.0),
-                    message: format!("nvm-windows installed ({version})."),
+                    message: format!("Node runtime manager ready ({version})."),
                 },
             ),
             Err(error) => emit_bootstrap_progress(
@@ -5058,7 +5522,7 @@ fn bootstrap_php_and_composer(app: tauri::AppHandle) {
                     phase: "nvm".to_string(),
                     status: "error".to_string(),
                     percent: None,
-                    message: format!("Failed to install nvm-windows: {error}"),
+                    message: format!("Node runtime manager setup failed: {error}"),
                 },
             ),
         }
@@ -5072,7 +5536,7 @@ fn bootstrap_php_and_composer(app: tauri::AppHandle) {
                 phase: "nginx".to_string(),
                 status: "skipped".to_string(),
                 percent: Some(100.0),
-                message: "nginx already exists.".to_string(),
+                message: "Web server runtime ready.".to_string(),
             },
         );
     } else {
@@ -5082,7 +5546,7 @@ fn bootstrap_php_and_composer(app: tauri::AppHandle) {
                 phase: "nginx".to_string(),
                 status: "started".to_string(),
                 percent: Some(0.0),
-                message: "Downloading latest nginx in background...".to_string(),
+                message: "Downloading web server runtime...".to_string(),
             },
         );
         let nginx_result = install_latest_nginx_with_progress(&bin_root, |pct| {
@@ -5092,7 +5556,7 @@ fn bootstrap_php_and_composer(app: tauri::AppHandle) {
                     phase: "nginx".to_string(),
                     status: "progress".to_string(),
                     percent: Some(pct),
-                    message: "Downloading latest nginx in background...".to_string(),
+                    message: "Downloading web server runtime...".to_string(),
                 },
             );
         });
@@ -5103,7 +5567,7 @@ fn bootstrap_php_and_composer(app: tauri::AppHandle) {
                     phase: "nginx".to_string(),
                     status: "completed".to_string(),
                     percent: Some(100.0),
-                    message: format!("nginx {version} ready."),
+                    message: format!("Web server runtime ready ({version})."),
                 },
             ),
             Err(error) => emit_bootstrap_progress(
@@ -5112,7 +5576,7 @@ fn bootstrap_php_and_composer(app: tauri::AppHandle) {
                     phase: "nginx".to_string(),
                     status: "error".to_string(),
                     percent: None,
-                    message: format!("Failed to download nginx: {error}"),
+                    message: format!("Web server runtime setup failed: {error}"),
                 },
             ),
         }
@@ -5132,7 +5596,7 @@ fn bootstrap_php_and_composer(app: tauri::AppHandle) {
                 phase: "services".to_string(),
                 status: "skipped".to_string(),
                 percent: Some(100.0),
-                message: "Auto-start disabled in Settings.".to_string(),
+                message: "Service startup disabled in settings.".to_string(),
             },
         );
         let _ = refresh_user_path_with_runtime_currents(&install_dir, &bin_root.join("mariadb"));
@@ -5145,7 +5609,7 @@ fn bootstrap_php_and_composer(app: tauri::AppHandle) {
             phase: "services".to_string(),
             status: "started".to_string(),
             percent: None,
-            message: "Starting nginx and MariaDB...".to_string(),
+            message: "Starting services...".to_string(),
         },
     );
 
@@ -5161,7 +5625,7 @@ fn bootstrap_php_and_composer(app: tauri::AppHandle) {
                     phase: "services".to_string(),
                     status: "error".to_string(),
                     percent: None,
-                    message: "Failed to lock MariaDB state for auto-start.".to_string(),
+                    message: "Failed to read database runtime state.".to_string(),
                 },
             );
             return;
@@ -5177,7 +5641,7 @@ fn bootstrap_php_and_composer(app: tauri::AppHandle) {
                 phase: "services".to_string(),
                 status: "error".to_string(),
                 percent: None,
-                message: format!("MariaDB auto-start failed: {error}"),
+                message: format!("Database runtime start failed: {error}"),
             },
         );
     }
@@ -5195,7 +5659,7 @@ fn bootstrap_php_and_composer(app: tauri::AppHandle) {
                 phase: "services".to_string(),
                 status: "error".to_string(),
                 percent: None,
-                message: format!("Nginx auto-start failed: {error}"),
+                message: format!("Web server runtime start failed: {error}"),
             },
         );
     }
@@ -5206,7 +5670,7 @@ fn bootstrap_php_and_composer(app: tauri::AppHandle) {
             phase: "services".to_string(),
             status: "completed".to_string(),
             percent: Some(100.0),
-            message: "Auto-start completed.".to_string(),
+            message: "Services ready.".to_string(),
         },
     );
     let _ = refresh_user_path_with_runtime_currents(&install_dir, &mariadb_install_dir);
@@ -5512,6 +5976,7 @@ pub fn run() {
             php_set_ini_values,
             php_set_current_line,
             php_restart_fpm,
+            php_install_laravel_installer,
             mariadb_get_catalog,
             mariadb_set_config,
             mariadb_install_latest,

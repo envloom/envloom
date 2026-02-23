@@ -14,6 +14,10 @@ export type PhpCatalogResponse = {
   maxUploadSizeMb: string;
   memoryLimitMb: string;
   currentLine: string | null;
+  laravelInstaller: {
+    installed: boolean;
+    version: string | null;
+  };
   runtimes: PhpLineRuntime[];
 };
 
@@ -56,4 +60,9 @@ export async function setPhpIniValues(
 export async function setPhpCurrentLine(line: string): Promise<PhpCatalogResponse> {
   if (!isTauri()) throw new Error("Tauri runtime not available");
   return invoke<PhpCatalogResponse>("php_set_current_line", { line });
+}
+
+export async function installOrUpdateLaravelInstaller(): Promise<PhpCatalogResponse> {
+  if (!isTauri()) throw new Error("Tauri runtime not available");
+  return invoke<PhpCatalogResponse>("php_install_laravel_installer");
 }

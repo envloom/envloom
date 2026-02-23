@@ -2,7 +2,6 @@ import { useEffect, useMemo, useState } from "react";
 import { Check } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { Separator } from "@/components/ui/separator";
 import {
   Table,
   TableBody,
@@ -11,6 +10,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { RuntimePageShell, RuntimePanel, RuntimeStat } from "./runtime-layout";
 import {
   getNodeCatalog,
   installNodeMajor,
@@ -58,6 +58,10 @@ export function NodePage() {
   const [currentVersionInput, setCurrentVersionInput] = useState("");
 
   const runtimes = useMemo(() => catalog?.runtimes ?? [], [catalog]);
+  const installedCount = catalog?.installedVersions.length ?? 0;
+  const updateCount = runtimes.filter(
+    (runtime) => runtime.installedVersion && isVersionNewer(runtime.latestVersion, runtime.installedVersion),
+  ).length;
 
   useEffect(() => {
     void refresh();
@@ -125,41 +129,21 @@ export function NodePage() {
   }
 
   return (
-    <div className="grid gap-6">
-      <div>
-        <h1 className="text-2xl font-semibold tracking-tight">Node</h1>
-      </div>
-      <Separator />
-
-      <section className="grid gap-3">
-        <div className="flex flex-wrap items-center gap-2">
-          <select
-            value={currentVersionInput}
-            onChange={(event) => setCurrentVersionInput(event.target.value)}
-            className="h-9 min-w-40 rounded-md border border-input bg-input px-3 text-sm"
-          >
-            <option value="" disabled>
-              Select installed version
-            </option>
-            {(catalog?.installedVersions ?? []).map((version) => (
-              <option key={version} value={version}>
-                {version}
-              </option>
-            ))}
-          </select>
-          <Button
-            variant="outline"
-            onClick={() => void handleSetCurrent()}
-            disabled={settingCurrent || !currentVersionInput || !catalog?.nvmAvailable}
-          >
-            {settingCurrent ? "Saving..." : "Set current"}
-          </Button>
-          <span className="text-sm text-muted-foreground">
-            Current: {catalog?.currentVersion ?? "not set"}
-          </span>
-        </div>
-        <h2 className="text-xl font-semibold">Versions</h2>
-        <div className="overflow-hidden rounded-lg border">
+    <RuntimePageShell
+      title="Node"
+      subtitle="Manage Node.js versions with local NVM and keep the current runtime explicit."
+      stats={
+        <>
+          <RuntimeStat label="NVM" value={catalog?.nvmAvailable ? "Ready" : "Missing"} hint={catalog?.error ?? "Installed in local runtime bin."} />
+          <RuntimeStat label="Current" value={catalog?.currentVersion ?? "Not set"} hint="Used by CLI and site actions." />
+          <RuntimeStat label="Installed" value={installedCount} hint="Node versions available locally." />
+          <RuntimeStat label="Updates" value={updateCount} hint="Installed majors with newer releases." />
+        </>
+      }
+    >
+      <div className="grid gap-4">
+        <RuntimePanel title="Versions" description="Install, update or remove Node majors available via NVM.">
+        <div className="overflow-hidden rounded-lg border bg-background">
           <Table>
             <TableHeader>
               <TableRow>
@@ -239,7 +223,39 @@ export function NodePage() {
           </Table>
         </div>
         {error ? <p className="text-sm text-destructive">{error}</p> : null}
-      </section>
-    </div>
+        </RuntimePanel>
+        <RuntimePanel
+          title="Current Version"
+          description="Select which installed Node version should be active in NVM."
+        >
+          <div className="flex flex-wrap items-center gap-2">
+            <select
+              value={currentVersionInput}
+              onChange={(event) => setCurrentVersionInput(event.target.value)}
+              className="h-9 min-w-40 rounded-md border border-input bg-input px-3 text-sm"
+            >
+              <option value="" disabled>
+                Select installed version
+              </option>
+              {(catalog?.installedVersions ?? []).map((version) => (
+                <option key={version} value={version}>
+                  {version}
+                </option>
+              ))}
+            </select>
+            <Button
+              variant="outline"
+              onClick={() => void handleSetCurrent()}
+              disabled={settingCurrent || !currentVersionInput || !catalog?.nvmAvailable}
+            >
+              {settingCurrent ? "Saving..." : "Set current"}
+            </Button>
+            <span className="text-sm text-muted-foreground">
+              Current: {catalog?.currentVersion ?? "not set"}
+            </span>
+          </div>
+        </RuntimePanel>
+      </div>
+    </RuntimePageShell>
   );
 }

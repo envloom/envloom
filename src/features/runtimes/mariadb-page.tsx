@@ -3,7 +3,6 @@ import { Check } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
-import { Separator } from "@/components/ui/separator";
 import {
   Dialog,
   DialogContent,
@@ -20,6 +19,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { RuntimePageShell, RuntimePanel, RuntimeStat } from "./runtime-layout";
 import {
   getMariaDbCatalog,
   installLatestMariaDb,
@@ -77,6 +77,11 @@ export function MariaDbPage() {
     const list = catalog?.runtimes ?? [];
     return [...list].sort((a, b) => Number(b.line) - Number(a.line));
   }, [catalog]);
+  const installedCount = runtimes.filter((runtime) => runtime.installedVersions.length > 0).length;
+  const updateCount = runtimes.filter((runtime) => {
+    const installed = runtime.installedVersions[0] ?? null;
+    return installed && isVersionNewer(runtime.latestVersion, installed);
+  }).length;
 
   useEffect(() => {
     void refresh();
@@ -211,15 +216,21 @@ export function MariaDbPage() {
   const installedLines = runtimes.filter((runtime) => runtime.installedVersions.length > 0);
 
   return (
-    <div className="grid gap-6">
-      <div>
-        <h1 className="text-2xl font-semibold tracking-tight">MariaDB</h1>
-      </div>
-      <Separator />
-
-      <section className="grid gap-3">
-        <h2 className="text-xl font-semibold">Versions</h2>
-        <div className="overflow-hidden rounded-lg border">
+    <RuntimePageShell
+      title="MariaDB"
+      subtitle="Versioned local database engine with configurable current line, port and root credentials."
+      stats={
+        <>
+          <RuntimeStat label="Current Line" value={catalog?.currentLine ? `MariaDB ${catalog.currentLine}` : "Not set"} hint="Used by mysql/mariadb shims." />
+          <RuntimeStat label="Port" value={catalog?.port ?? 3306} hint="Client/server default port." />
+          <RuntimeStat label="Installed" value={installedCount} hint="Major lines installed locally." />
+          <RuntimeStat label="Updates" value={updateCount} hint="Installed lines with newer builds." />
+        </>
+      }
+    >
+      <div className="grid gap-4">
+        <RuntimePanel title="Versions" description="Install, update and remove MariaDB major lines.">
+        <div className="overflow-hidden rounded-lg border bg-background">
           <Table>
             <TableHeader>
               <TableRow>
@@ -296,13 +307,10 @@ export function MariaDbPage() {
           </Table>
         </div>
         {error ? <p className="text-sm text-destructive">{error}</p> : null}
-      </section>
+        </RuntimePanel>
 
-      <Separator />
-
-      <section className="grid gap-2">
-        <h3 className="text-2xl font-semibold">Current Version</h3>
-        <p className="text-sm text-muted-foreground">Select which installed MariaDB major line is current.</p>
+        <div className="grid gap-4 lg:grid-cols-2">
+      <RuntimePanel title="Current Version" description="Select which installed MariaDB major line is current.">
         <div className="flex flex-wrap items-center gap-2">
           <select
             value={currentLineInput}
@@ -329,13 +337,9 @@ export function MariaDbPage() {
             Current: {catalog?.currentLine ? `MariaDB ${catalog.currentLine}` : "not set"}
           </span>
         </div>
-      </section>
+      </RuntimePanel>
 
-      <Separator />
-
-      <section className="grid gap-2">
-        <h3 className="text-2xl font-semibold">Port</h3>
-        <p className="text-sm text-muted-foreground">Configure the MariaDB port.</p>
+      <RuntimePanel title="Port" description="Configure the MariaDB port.">
         <div className="flex items-center gap-2">
           <Input
             type="number"
@@ -347,13 +351,10 @@ export function MariaDbPage() {
             {savingConfig ? "Saving..." : "Save port"}
           </Button>
         </div>
-      </section>
+      </RuntimePanel>
+        </div>
 
-      <Separator />
-
-      <section className="grid gap-2">
-        <h3 className="text-2xl font-semibold">Root Password</h3>
-        <p className="text-sm text-muted-foreground">Set root password used in generated client config.</p>
+      <RuntimePanel title="Root Password" description="Set root password used in generated client config.">
         <div className="flex items-center gap-2">
           <Input
             type="password"
@@ -368,7 +369,7 @@ export function MariaDbPage() {
         <p className="text-xs text-muted-foreground">
           Applies the password to MariaDB if it is running, and updates generated client config.
         </p>
-      </section>
+      </RuntimePanel>
 
       <Dialog open={installPasswordDialogOpen} onOpenChange={setInstallPasswordDialogOpen}>
         <DialogContent className="max-w-md!">
@@ -404,6 +405,7 @@ export function MariaDbPage() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
-    </div>
+      </div>
+    </RuntimePageShell>
   );
 }

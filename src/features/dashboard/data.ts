@@ -3,15 +3,16 @@ import {
   FolderKanban,
   Server,
   Settings,
-  SquareTerminal,
   TerminalSquare,
 } from "lucide-react";
+import { Php } from "@/components/icons/php";
+import { Nodejs } from "@/components/icons/node";
 
 export const navItems = [
   { label: "Dashboard", icon: Activity, route: "/dashboard" },
   { label: "Sites", icon: FolderKanban, route: "/sites" },
-  { label: "PHP", icon: SquareTerminal, route: "/runtimes/php" },
-  { label: "Node", icon: TerminalSquare, route: "/runtimes/node" },
+  { label: "PHP", icon: Php, route: "/runtimes/php" },
+  { label: "Node", icon: Nodejs, route: "/runtimes/node" },
   { label: "MariaDB", icon: Server, route: "/runtimes/mariadb" },
   { label: "Logs", icon: TerminalSquare, route: "/logs" },
   { label: "Settings", icon: Settings, route: "/settings" },

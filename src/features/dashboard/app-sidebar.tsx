@@ -27,13 +27,6 @@ export function AppSidebar({ currentRoute, onNavigate }: AppSidebarProps) {
           </Button>
         ))}
       </nav>
-      <div className="mt-auto rounded-xl border bg-card p-3">
-        <p className="text-xs uppercase tracking-wide text-muted-foreground">Systray status</p>
-        <div className="mt-2 flex items-center gap-2">
-          <span className="inline-flex size-2 rounded-full bg-emerald-500"></span>
-          <p className="text-sm font-medium">All services healthy</p>
-        </div>
-      </div>
     </aside>
   );
 }

@@ -170,11 +170,19 @@ pub(crate) struct PhpLineRuntime {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct LaravelInstallerStatus {
+    pub(crate) installed: bool,
+    pub(crate) version: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct PhpCatalogResponse {
     pub(crate) base_port: u16,
     pub(crate) max_upload_size_mb: String,
     pub(crate) memory_limit_mb: String,
     pub(crate) current_line: Option<String>,
+    pub(crate) laravel_installer: LaravelInstallerStatus,
     pub(crate) runtimes: Vec<PhpLineRuntime>,
 }
 

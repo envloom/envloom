@@ -18,6 +18,8 @@
 - [x] PHP: base port configurable y calculo por linea (`9000 -> 9074`, `9081`, etc).
 - [x] PHP: gestion de `php.ini` base + overrides por version.
 - [x] Node: catalogo real con `nvm`, instalacion por major y selector de version current.
+- [x] Node/NVM local: `nvm.exe` en `bin/nvm`, versiones en `bin/node/<version>` y `current` en `bin/node/current`.
+- [x] Node: primera instalacion ejecuta `nvm use` automaticamente; instalaciones posteriores no cambian current.
 - [x] MariaDB: catalogo de majors desde API oficial, instalacion por major (latest windows x64 zip) y deteccion local.
 - [x] MariaDB: selector current y junction `bin/mariadb/current`.
 - [x] Nginx: descarga de latest release (GitHub), descompresion y ubicacion en `bin/nginx/<version>`.
@@ -25,6 +27,7 @@
 - [x] Verificacion de checksums de descargas (SHA256 cuando el provider lo publica).
 - [x] Deteccion/recuperacion de binarios corruptos (limpieza automatica de instalaciones invalidas).
 - [x] Shims en `bin` por version y `current` (PHP, MariaDB/MySQL, Nginx, Composer).
+- [x] Shims MariaDB/MySQL con fallback de binarios (`mariadb.exe`, `mariadb-admin.exe`) para builds sin `mysql.exe/mysqladmin.exe`.
 - [x] `PATH` gestionado por Envloom con una sola entrada (`bin`) para evitar basura.
 - [x] Check de updates en background cada hora para PHP/Node/MariaDB (cache de releases 1h).
 - [x] Boton `Update` por runtime instalado cuando existe build/version mas nueva.
@@ -34,16 +37,22 @@
 - [x] En primer arranque descarga PHP mas reciente con splash/progreso bloqueante.
 - [x] Composer descargado en background (`bin/composer/composer.phar` + shim `bin/composer.cmd`).
 - [x] Instalacion de `nvm-windows` en background si no existe.
+- [x] Instalacion de `nvm-windows` via instalador oficial descargado desde GitHub (sin `winget`).
+- [x] Bootstrap NVM migrado a `nvm-noinstall.zip` (release) extraido en `bin/nvm`.
+- [x] Script `install-elevated.cmd` para NVM con UAC y configuracion de `NVM_HOME/NVM_SYMLINK` dentro de `bin`.
 - [x] Descarga de Nginx en background.
 - [x] MariaDB no se descarga al iniciar (instalacion manual desde su pagina).
 - [x] Al iniciar app se comprueba si los binarios ya existen antes de descargar.
 - [x] Todas las descargas usan una carpeta comun `bin/_downloads`.
 - [x] Limpieza de archivos descargados tras descomprimir.
+- [x] Descargas y descompresion ZIP de runtimes desde Rust (`reqwest` + `zip`) sin `Expand-Archive`.
 - [x] Nginx y MariaDB se intentan iniciar automaticamente al iniciar app.
+- [x] Invocaciones PowerShell ocultas (`CREATE_NO_WINDOW`) para evitar popups.
 
 ### 3) Config por proyecto
 - [x] Registro manual de sitios desde UI (persistido en backend `sites.json`).
 - [x] Provisionado real de sitios nuevos (Laravel + starter kit + Composer/NPM/migrations).
+- [x] Starter kits de Laravel descargados desde `latest release` (GitHub API zipball), sin `git clone`.
 - [x] `.env` desde `.env.example` cuando falta + `APP_URL` actualizado por dominio.
 - [x] Sitios vinculados (`link existing`) no sobreescriben `APP_URL`.
 - [ ] Archivo `.envloom.json` por proyecto.
@@ -61,6 +70,7 @@
 - [x] Al cerrar la app se detienen automaticamente PHP-FPM, Nginx y MariaDB.
 - [x] PHP-FPM gestionado como procesos `php-cgi.exe` por version instalada y puertos configurados.
 - [x] Stop de MariaDB reforzado (shutdown + kill por raiz de runtime + verificacion de cierre de puerto).
+- [x] Stop de PHP-FPM reforzado (kill por ruta + CIM fallback + `taskkill` + verificacion).
 - [ ] Start/Stop/Restart explicitos de Nginx desde UI/CLI.
 - [ ] Start/Stop/Restart explicitos de MariaDB desde UI/CLI.
 
@@ -80,6 +90,7 @@
 - [x] Pagina PHP funcional.
 - [x] Pagina Node funcional.
 - [x] Pagina MariaDB funcional (lista versiones + config minima).
+- [x] Paginas de runtimes (PHP/Node/MariaDB) unificadas con layout visual comun (`hero`, stats, panels).
 - [x] Dashboard con estado de servicios en vivo.
 - [ ] Pagina Services funcional con acciones de control.
 - [x] Pagina Sites base funcional (listado, detalle, iconos SSL/link y wizard inicial).
@@ -111,12 +122,14 @@
 
 ### 8) Logs y diagnostico
 - [x] Logs fisicos de runtime para depuracion (`runtime.log`).
+- [x] Logging de `nvm install` / `nvm use` (comando + output) en `runtime.log`.
 - [x] Captura de errores de arranque de MariaDB/Nginx con contexto.
 - [x] Timestamp de logs en formato `YYYY-MM-DD HH:MM:SS`.
 - [x] Logs centralizados en carpeta `logs` (mismo nivel que `bin`/`config`/`sites`).
 - [x] Nginx: logs globales + logs por sitio (`access` y `error`).
 - [x] PHP: log de errores por runtime/version.
 - [x] `php.ini` versionado incluye `log_errors` + `error_log` apuntando a `logs/php` de la app.
+- [x] Estado real de `Laravel Installer` en pagina PHP + accion `Install/Update` desde UI.
 - [x] MariaDB: `error`, `general` y `slow query` logs en carpeta dedicada.
 - [x] Viewer unificado basico (Runtime/Nginx/PHP/MariaDB) en pagina Logs.
 - [ ] Filtros por servicio/nivel/fecha.
@@ -136,6 +149,7 @@
 - [x] Card de servicios con estado real y estado intermedio `starting`.
 - [x] Card de sites (max 10) con nombre, URL, PHP y estado SSL.
 - [x] Boton `View more` hacia pagina `Sites`.
+- [x] Sidebar con iconos personalizados para PHP y Node (SVG locales).
 
 ### 12) Configuracion global
 - [x] Config global Envloom persistida en `~/.envloom/config.json`.

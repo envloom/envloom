@@ -1,7 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  Atom,
-  Blend,
   FolderOpen,
   Globe,
   Link2,
@@ -12,7 +10,6 @@ import {
   Search,
   Shield,
   Trash2,
-  Workflow,
 } from "lucide-react";
 import { isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -22,6 +19,11 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Separator } from "@/components/ui/separator";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Laravel } from "@/components/icons/laravel";
+import { React as ReactIcon } from "@/components/icons/react";
+import { Vue } from "@/components/icons/vue";
+import { Svelte } from "@/components/icons/svelte";
+import { Livewire } from "@/components/icons/livewire";
 import {
   Dialog,
   DialogContent,
@@ -72,11 +74,11 @@ function toSlug(value: string) {
 
 function starterCards() {
   return [
-    { value: "none", label: "No starter kit", icon: PackagePlus },
-    { value: "react", label: "React", icon: Atom },
-    { value: "vue", label: "Vue", icon: Blend },
-    { value: "svelte", label: "Svelte", icon: Workflow },
-    { value: "livewire", label: "Livewire", icon: PackagePlus },
+    { value: "none", label: "No starter kit", icon: Laravel },
+    { value: "react", label: "React", icon: ReactIcon },
+    { value: "vue", label: "Vue", icon: Vue },
+    { value: "svelte", label: "Svelte", icon: Svelte },
+    { value: "livewire", label: "Livewire", icon: Livewire },
   ];
 }
 
