@@ -11,7 +11,7 @@ export function AppSidebar({ currentRoute, onNavigate }: AppSidebarProps) {
   return (
     <aside className="flex h-full flex-col rounded-2xl border bg-sidebar/80 p-4 text-sidebar-foreground shadow-sm backdrop-blur">
       <div className="overflow-hidden p-0">
-        <img src="/logo.png" alt="Envloom" className="w-full object-contain" />
+        <img src="/logo.svg" alt="Envloom" className="w-full object-contain" />
       </div>
       <Separator className="my-4" />
       <nav className="grid gap-1">
