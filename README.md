@@ -4,45 +4,33 @@
 
 # Envloom
 
-Envloom is a local development stack manager focused on a simple workflow with versioned runtimes and per-site configuration.
+Envloom is a local development stack manager for Windows with versioned runtimes, per-site config, local SSL, and a desktop-first workflow.
 
 ## Features
 
-- Versioned runtime management for:
-  - PHP
-  - Node (via NVM)
-  - MariaDB
-  - Nginx
-- Runtime `current` selection with local shims in `bin`
-- PHP runtime configuration:
-  - `php.ini` managed values
-  - version-specific overrides
-  - FPM port mapping by PHP line
-- MariaDB runtime configuration:
-  - version install/current selection
-  - root password handling
-  - local config generation
-- Site management:
-  - create new Laravel sites
+- Runtime manager for PHP, Node (NVM), MariaDB and Nginx
+- Install multiple versions and choose a `current` version per runtime
+- Local shims in `bin` (`php`, `php85`, `mysql`, `nginx`, `composer`, `loom`)
+- PHP FPM port mapping by PHP line + managed `php.ini`
+- MariaDB runtime install/current selection + root password config
+- Sites management:
   - link existing projects
-  - per-site PHP version selection
+  - create Laravel sites
+  - per-site PHP version
   - local SSL on/off
-- Networking automation:
-  - Nginx vhost generation per site
-  - hosts file block management (with elevation helper)
+- Local networking automation:
+  - Nginx site configs
   - local CA + per-site certificates
-- Service controls:
-  - start/stop all
-  - service status in dashboard
-  - auto-start on app launch (configurable)
-  - auto-stop on app exit
-- Logs and diagnostics:
-  - centralized runtime logs
-  - PHP / MariaDB / Nginx logs
-  - in-app log viewer
-- Global settings:
-  - `autoStartServices`
-  - `autoUpdate`
+  - hosts block sync (with elevation helper)
+- Dashboard service status + `Start all` / `Stop all`
+- Systray with quick actions, runtime switching, site links, configs and logs shortcuts
+- Centralized logs (`runtime`, PHP, MariaDB, Nginx) + in-app log viewer
+- Settings:
+  - auto-start services
+  - auto-check updates
+  - start with Windows
+  - start minimized
+- CLI (`loom`) for local project linking and runtime switching
 
 For the detailed implementation checklist, see [`FEATURES.md`](./FEATURES.md).
 

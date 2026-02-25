@@ -15,7 +15,10 @@ use std::{
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tauri::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use tauri::{Emitter, Manager};
+use tauri_plugin_opener::OpenerExt;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 mod domain;
@@ -39,6 +42,19 @@ const MARIADB_RELEASES_URL: &str = "https://downloads.mariadb.org/rest-api/maria
 static SHUTDOWN_STOP_TRIGGERED: AtomicBool = AtomicBool::new(false);
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+const TRAY_MENU_OPEN: &str = "tray.open";
+const TRAY_MENU_START_ALL: &str = "tray.start_all";
+const TRAY_MENU_STOP_ALL: &str = "tray.stop_all";
+const TRAY_MENU_RELOAD_ALL: &str = "tray.reload_all";
+const TRAY_MENU_QUIT: &str = "tray.quit";
+const TRAY_MENU_SSL_ALL_ON: &str = "tray.nginx.ssl_all_on";
+const TRAY_MENU_SSL_ALL_OFF: &str = "tray.nginx.ssl_all_off";
+const TRAY_MENU_OPEN_PHP_INI: &str = "tray.php.open_ini";
+const TRAY_MENU_OPEN_PHP_EXT_DIR: &str = "tray.php.open_ext_dir";
+const TRAY_MENU_OPEN_PHP_LOGS_DIR: &str = "tray.php.open_logs_dir";
+const TRAY_MENU_OPEN_NGINX_ACCESS_LOG: &str = "tray.nginx.open_access_log";
+const TRAY_MENU_OPEN_NGINX_ERROR_LOG: &str = "tray.nginx.open_error_log";
+const TRAY_MENU_OPEN_NGINX_CONFIGS_DIR: &str = "tray.nginx.open_configs_dir";
 
 fn envloom_global_config_path() -> PathBuf {
     let home = std::env::var_os("USERPROFILE")
@@ -52,8 +68,82 @@ fn app_settings_response(path: &Path, config: &AppSettings) -> AppSettingsRespon
     AppSettingsResponse {
         auto_start_services: config.auto_start_services,
         auto_update: config.auto_update,
+        start_with_windows: config.start_with_windows,
+        start_minimized: config.start_minimized,
         config_path: path.to_string_lossy().to_string(),
     }
+}
+
+#[cfg(windows)]
+fn sync_windows_startup_setting(config: &AppSettings) -> Result<(), String> {
+    const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+    const VALUE_NAME: &str = "Envloom";
+
+    if !config.start_with_windows {
+        let mut command = Command::new("reg");
+        command
+            .arg("delete")
+            .arg(RUN_KEY)
+            .arg("/v")
+            .arg(VALUE_NAME)
+            .arg("/f");
+        command.creation_flags(CREATE_NO_WINDOW);
+        let output = command
+            .output()
+            .map_err(|e| format!("failed to update Windows startup entry: {e}"))?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let combined = format!("{} {}", stdout.trim(), stderr.trim()).to_lowercase();
+        if combined.contains("unable to find") || combined.contains("no se puede encontrar") {
+            return Ok(());
+        }
+        return Err(format!(
+            "failed to remove Windows startup entry (exit {}): {} {}",
+            output.status.code().unwrap_or(-1),
+            stdout.trim(),
+            stderr.trim()
+        ));
+    }
+
+    let exe_path = std::env::current_exe().map_err(|e| format!("failed to resolve current exe: {e}"))?;
+    let command_value = if config.start_minimized {
+        format!("\"{}\" --minimized", exe_path.display())
+    } else {
+        format!("\"{}\"", exe_path.display())
+    };
+
+    let mut command = Command::new("reg");
+    command
+        .arg("add")
+        .arg(RUN_KEY)
+        .arg("/v")
+        .arg(VALUE_NAME)
+        .arg("/t")
+        .arg("REG_SZ")
+        .arg("/d")
+        .arg(command_value)
+        .arg("/f");
+    command.creation_flags(CREATE_NO_WINDOW);
+    let output = command
+        .output()
+        .map_err(|e| format!("failed to write Windows startup entry: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "failed to write Windows startup entry (exit {}): {} {}",
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn sync_windows_startup_setting(_config: &AppSettings) -> Result<(), String> {
+    Ok(())
 }
 
 fn normalize_mb_value(raw: &str, allow_unlimited: bool) -> String {
@@ -1135,6 +1225,14 @@ fn ensure_runtime_shims(bin_root: &Path) -> Result<PathBuf, String> {
             .map_err(|e| format!("failed to write composer shim: {e}"))?;
     }
     managed_shims.insert("composer.cmd".to_string());
+    let loom_cmd = shims_dir.join("loom.cmd");
+    let loom_cmd_content = "@ECHO OFF\r\nset \"ENVLOOM_EXE=%~dp0..\\Envloom.exe\"\r\nif exist \"%ENVLOOM_EXE%\" goto run\r\nset \"ENVLOOM_EXE=%~dp0..\\target\\debug\\envloom.exe\"\r\nif exist \"%ENVLOOM_EXE%\" goto run\r\nset \"ENVLOOM_EXE=%~dp0..\\target\\release\\envloom.exe\"\r\nif exist \"%ENVLOOM_EXE%\" goto run\r\necho Envloom executable not found. Expected near \"%~dp0\".>&2\r\nexit /b 1\r\n:run\r\n\"%ENVLOOM_EXE%\" --cli %*\r\n";
+    let current = fs::read_to_string(&loom_cmd).unwrap_or_default();
+    if current != loom_cmd_content {
+        fs::write(&loom_cmd, loom_cmd_content)
+            .map_err(|e| format!("failed to write loom shim: {e}"))?;
+    }
+    managed_shims.insert("loom.cmd".to_string());
     let legacy_composer_bat = bin_root.join("composer").join("composer.bat");
     if legacy_composer_bat.exists() {
         let _ = fs::remove_file(legacy_composer_bat);
@@ -1308,6 +1406,7 @@ fn ensure_runtime_shims(bin_root: &Path) -> Result<PathBuf, String> {
                 || name == "mariadb.cmd"
                 || managed_mariadb
                 || name == "composer.cmd"
+                || name == "loom.cmd"
                 || name == "nginx.cmd")
                 && !managed_shims.contains(&name)
             {
@@ -1337,6 +1436,7 @@ fn ensure_runtime_shims(bin_root: &Path) -> Result<PathBuf, String> {
                     "php.cmd"
                         | "nginx.cmd"
                         | "composer.cmd"
+                        | "loom.cmd"
                         | "mysql.cmd"
                         | "mysqladmin.cmd"
                         | "mariadb.cmd"
@@ -1359,10 +1459,20 @@ fn desired_runtime_path_entries(php_install_dir: &Path, mariadb_install_dir: &Pa
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| php_install_dir.to_path_buf());
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf));
 
     let _ = mariadb_install_dir;
     let _ = ensure_runtime_shims(&bin_root);
-    vec![bin_root.to_string_lossy().to_string()]
+    let mut entries = vec![bin_root.to_string_lossy().to_string()];
+    if let Some(exe_dir) = exe_dir {
+        let exe_dir_str = exe_dir.to_string_lossy().to_string();
+        if !entries.iter().any(|v| v.eq_ignore_ascii_case(&exe_dir_str)) {
+            entries.push(exe_dir_str);
+        }
+    }
+    entries
 }
 
 fn refresh_user_path_with_runtime_currents(php_install_dir: &Path, mariadb_install_dir: &Path) -> Result<(), String> {
@@ -1379,6 +1489,7 @@ fn refresh_user_path_with_runtime_currents(php_install_dir: &Path, mariadb_insta
     let legacy_php_current = php_install_dir.join("current").to_string_lossy().to_string();
     let legacy_mariadb_current_bin = mariadb_install_dir.join("current").join("bin").to_string_lossy().to_string();
     let legacy_composer_entry = bin_root.join("composer").to_string_lossy().to_string();
+    let legacy_envloom_bin_entry = bin_root.join("..").to_string_lossy().to_string();
     let legacy_nvm_symlink = nvm_symlink_path().unwrap_or_default();
     let desired_literal = desired
         .iter()
@@ -1386,12 +1497,13 @@ fn refresh_user_path_with_runtime_currents(php_install_dir: &Path, mariadb_insta
         .collect::<Vec<_>>()
         .join(",");
     let legacy_literal = format!(
-        "'{}','{}','{}','{}','{}','{}'",
+        "'{}','{}','{}','{}','{}','{}','{}'",
         ps_quote(&legacy_nginx_entry),
         ps_quote(&legacy_shims_entry),
         ps_quote(&legacy_php_current),
         ps_quote(&legacy_mariadb_current_bin),
         ps_quote(&legacy_composer_entry),
+        ps_quote(&legacy_envloom_bin_entry),
         ps_quote(&legacy_nvm_symlink)
     );
     let script = format!(
@@ -5762,6 +5874,8 @@ fn settings_set(
     state: tauri::State<'_, AppState>,
     auto_start_services: bool,
     auto_update: bool,
+    start_with_windows: bool,
+    start_minimized: bool,
 ) -> Result<AppSettingsResponse, String> {
     let mut guard = state
         .settings
@@ -5769,12 +5883,18 @@ fn settings_set(
         .map_err(|_| "failed to lock settings state".to_string())?;
     guard.config.auto_start_services = auto_start_services;
     guard.config.auto_update = auto_update;
+    guard.config.start_with_windows = start_with_windows;
+    guard.config.start_minimized = start_minimized;
+    sync_windows_startup_setting(&guard.config)?;
     save_app_settings(&guard.path, &guard.config)?;
     append_runtime_log(
         &state.log_path,
         "INFO",
         "settings",
-        &format!("Updated settings: autoStartServices={}, autoUpdate={}", auto_start_services, auto_update),
+        &format!(
+            "Updated settings: autoStartServices={}, autoUpdate={}, startWithWindows={}, startMinimized={}",
+            auto_start_services, auto_update, start_with_windows, start_minimized
+        ),
     );
     Ok(app_settings_response(&guard.path, &guard.config))
 }
@@ -5831,6 +5951,1474 @@ fn stop_services_on_shutdown(app: &tauri::AppHandle) {
     } else {
         append_runtime_log(&log_path, "INFO", "shutdown.mysql", "MariaDB stopped");
     }
+}
+
+fn show_main_window(app: &tauri::AppHandle) -> Result<(), String> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "main window not found".to_string())?;
+    let _ = window.show();
+    let _ = window.unminimize();
+    let _ = window.set_focus();
+    Ok(())
+}
+
+fn tray_start_all_services(app: &tauri::AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let log_path = state.log_path.clone();
+    append_runtime_log(&log_path, "INFO", "tray.start_all", "Tray start all requested");
+
+    let (php_install_dir, php_config) = {
+        let guard = state
+            .php
+            .lock()
+            .map_err(|_| "failed to lock php state".to_string())?;
+        (guard.install_dir.clone(), guard.config.clone())
+    };
+    let (mariadb_install_dir, mariadb_config) = {
+        let guard = state
+            .mariadb
+            .lock()
+            .map_err(|_| "failed to lock mariadb state".to_string())?;
+        (guard.install_dir.clone(), guard.config.clone())
+    };
+
+    let mut errors: Vec<String> = Vec::new();
+    if let Err(error) = restart_php_fpm_services(&php_install_dir, &php_config) {
+        append_runtime_log(&log_path, "ERROR", "tray.start_all.php", &error);
+        errors.push(format!("php: {error}"));
+    }
+
+    let bin_root = php_install_dir
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| php_install_dir.clone());
+    if let Err(error) = start_nginx_if_needed(&bin_root.join("nginx")) {
+        append_runtime_log(&log_path, "ERROR", "tray.start_all.nginx", &error);
+        errors.push(format!("nginx: {error}"));
+    }
+    if let Err(error) = initialize_and_start_mariadb_if_needed(&mariadb_install_dir, &mariadb_config, Some(&log_path)) {
+        append_runtime_log(&log_path, "ERROR", "tray.start_all.mysql", &error);
+        errors.push(format!("mysql: {error}"));
+    }
+    if let Err(error) = apply_mariadb_root_password_if_needed(&mariadb_install_dir, &mariadb_config, Some(&log_path)) {
+        append_runtime_log(&log_path, "ERROR", "tray.start_all.mysql_password", &error);
+        errors.push(format!("mysql-password: {error}"));
+    }
+
+    if !errors.is_empty() {
+        let message = errors.join(" | ");
+        append_runtime_log(&log_path, "ERROR", "tray.start_all", &message);
+        return Err(message);
+    }
+
+    let _ = refresh_user_path_with_runtime_currents(&php_install_dir, &mariadb_install_dir);
+    append_runtime_log(&log_path, "INFO", "tray.start_all", "Tray start all completed");
+    Ok(())
+}
+
+fn tray_stop_all_services(app: &tauri::AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let log_path = state.log_path.clone();
+    append_runtime_log(&log_path, "INFO", "tray.stop_all", "Tray stop all requested");
+
+    let (php_install_dir, mariadb_install_dir, mariadb_config) = {
+        let php_guard = state
+            .php
+            .lock()
+            .map_err(|_| "failed to lock php state".to_string())?;
+        let mariadb_guard = state
+            .mariadb
+            .lock()
+            .map_err(|_| "failed to lock mariadb state".to_string())?;
+        (
+            php_guard.install_dir.clone(),
+            mariadb_guard.install_dir.clone(),
+            mariadb_guard.config.clone(),
+        )
+    };
+
+    let mut errors: Vec<String> = Vec::new();
+    if let Err(error) = stop_php_fpm_services(&php_install_dir) {
+        append_runtime_log(&log_path, "ERROR", "tray.stop_all.php", &error);
+        errors.push(format!("php: {error}"));
+    }
+    let bin_root = php_install_dir
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| php_install_dir.clone());
+    if let Err(error) = stop_nginx_if_running(&bin_root.join("nginx")) {
+        append_runtime_log(&log_path, "ERROR", "tray.stop_all.nginx", &error);
+        errors.push(format!("nginx: {error}"));
+    }
+    if let Err(error) = stop_mariadb_if_running(&mariadb_install_dir, &mariadb_config) {
+        append_runtime_log(&log_path, "ERROR", "tray.stop_all.mysql", &error);
+        errors.push(format!("mysql: {error}"));
+    }
+
+    if !errors.is_empty() {
+        let message = errors.join(" | ");
+        append_runtime_log(&log_path, "ERROR", "tray.stop_all", &message);
+        return Err(message);
+    }
+
+    append_runtime_log(&log_path, "INFO", "tray.stop_all", "Tray stop all completed");
+    Ok(())
+}
+
+fn tray_reload_all_services(app: &tauri::AppHandle) -> Result<(), String> {
+    tray_stop_all_services(app)?;
+    tray_start_all_services(app)
+}
+
+fn tray_open_url(app: &tauri::AppHandle, url: &str) -> Result<(), String> {
+    app.opener()
+        .open_url(url.to_string(), None::<String>)
+        .map_err(|e| format!("failed to open url '{url}': {e}"))
+}
+
+fn tray_open_path(app: &tauri::AppHandle, path: &Path) -> Result<(), String> {
+    app.opener()
+        .open_path(path.to_string_lossy().to_string(), None::<String>)
+        .map_err(|e| format!("failed to open path '{}': {e}", path.display()))
+}
+
+fn tray_php_set_current_line(app: &tauri::AppHandle, line: &str) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let mariadb_install_dir = state
+        .mariadb
+        .lock()
+        .map_err(|_| "failed to lock mariadb state".to_string())?
+        .install_dir
+        .clone();
+    let mut guard = state
+        .php
+        .lock()
+        .map_err(|_| "failed to lock php state".to_string())?;
+    ensure_php_config_defaults(&mut guard.config);
+    let install_dir = guard.install_dir.clone();
+    sync_local_php_installations(&install_dir, &mut guard.config)?;
+    let installed = guard.config.installed.get(line).cloned().unwrap_or_default();
+    if installed.is_empty() {
+        return Err(format!("php line {line} is not installed"));
+    }
+    set_php_current_link(&guard.install_dir, line)?;
+    guard.config.current_line = Some(line.to_string());
+    save_php_config(&guard.config_path, &guard.config)?;
+    let _ = refresh_user_path_with_runtime_currents(&guard.install_dir, &mariadb_install_dir);
+    append_runtime_log(
+        &state.log_path,
+        "INFO",
+        "tray.php.current",
+        &format!("PHP current line set to {line}"),
+    );
+    Ok(())
+}
+
+fn tray_mariadb_set_current_line(app: &tauri::AppHandle, line: &str) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let php_install_dir = state
+        .php
+        .lock()
+        .map_err(|_| "failed to lock php state".to_string())?
+        .install_dir
+        .clone();
+    let mut guard = state
+        .mariadb
+        .lock()
+        .map_err(|_| "failed to lock mariadb state".to_string())?;
+    ensure_mariadb_config_defaults(&mut guard.config);
+    let install_dir = guard.install_dir.clone();
+    sync_local_mariadb_installations(&install_dir, &mut guard.config)?;
+    let installed = guard.config.installed.get(line).cloned().unwrap_or_default();
+    if installed.is_empty() {
+        return Err(format!("mariadb line {line} is not installed"));
+    }
+    guard.config.current_line = Some(line.to_string());
+    set_mariadb_current_link(&guard.install_dir, line)?;
+    save_mariadb_config(&guard.config_path, &guard.config)?;
+    let _ = refresh_user_path_with_runtime_currents(&php_install_dir, &guard.install_dir);
+    append_runtime_log(
+        &state.log_path,
+        "INFO",
+        "tray.mysql.current",
+        &format!("MariaDB current line set to {line}"),
+    );
+    Ok(())
+}
+
+fn tray_node_set_current_version(app: &tauri::AppHandle, version: &str) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let log_path = state.log_path.clone();
+    let catalog = build_node_catalog();
+    if !catalog.nvm_available {
+        return Err(catalog
+            .error
+            .unwrap_or_else(|| "Node runtime manager is not available".to_string()));
+    }
+    if !catalog.installed_versions.iter().any(|v| v == version) {
+        return Err(format!("node version {version} is not installed"));
+    }
+    append_runtime_log(&log_path, "INFO", "tray.node.current", &format!("Running: nvm use {version}"));
+    run_nvm_command(&["use", version])?;
+    let php_install_dir = state
+        .php
+        .lock()
+        .map_err(|_| "failed to lock php state".to_string())?
+        .install_dir
+        .clone();
+    let mariadb_install_dir = state
+        .mariadb
+        .lock()
+        .map_err(|_| "failed to lock mariadb state".to_string())?
+        .install_dir
+        .clone();
+    let _ = refresh_user_path_with_runtime_currents(&php_install_dir, &mariadb_install_dir);
+    append_runtime_log(
+        &log_path,
+        "INFO",
+        "tray.node.current",
+        &format!("Node current version set to {version}"),
+    );
+    Ok(())
+}
+
+fn tray_php_install_latest_line(app: &tauri::AppHandle, line: &str) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let log_path = state.log_path.clone();
+    let mariadb_install_dir = state
+        .mariadb
+        .lock()
+        .map_err(|_| "failed to lock mariadb state".to_string())?
+        .install_dir
+        .clone();
+    let mut guard = state
+        .php
+        .lock()
+        .map_err(|_| "failed to lock php state".to_string())?;
+    ensure_php_config_defaults(&mut guard.config);
+    let install_dir = guard.install_dir.clone();
+    sync_local_php_installations(&install_dir, &mut guard.config)?;
+    let latest = latest_builds_with_fallback(&guard.cache_path);
+    let build = latest
+        .get(line)
+        .cloned()
+        .ok_or_else(|| format!("could not find latest TS x64 build for PHP {line}"))?;
+    let had_current_before = guard
+        .config
+        .current_line
+        .as_ref()
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false);
+    append_runtime_log(
+        &log_path,
+        "INFO",
+        "tray.php.install",
+        &format!("Installing PHP line {line} ({})", build.version),
+    );
+    install_php_line_build_with_progress(&guard.install_dir, line, &build, |_| {})?;
+    let line_dir = guard.install_dir.join(line);
+    apply_php_ini_to_line(&guard.install_dir, &guard.template_dir, line, &guard.config)?;
+    let installed_version = detect_php_version_from_binary(&line_dir).unwrap_or(build.version);
+    guard
+        .config
+        .installed
+        .insert(line.to_string(), vec![installed_version.clone()]);
+    guard
+        .config
+        .active
+        .insert(line.to_string(), installed_version);
+    if !had_current_before {
+        guard.config.current_line = Some(line.to_string());
+        set_php_current_link(&guard.install_dir, line)?;
+    } else if let Some(current_line) = guard.config.current_line.clone() {
+        let _ = set_php_current_link(&guard.install_dir, &current_line);
+    }
+    restart_php_fpm_services(&guard.install_dir, &guard.config)?;
+    save_php_config(&guard.config_path, &guard.config)?;
+    let _ = refresh_user_path_with_runtime_currents(&guard.install_dir, &mariadb_install_dir);
+    append_runtime_log(
+        &log_path,
+        "INFO",
+        "tray.php.install",
+        &format!("PHP line {line} installed"),
+    );
+    Ok(())
+}
+
+fn tray_mariadb_install_latest_line(app: &tauri::AppHandle, line: &str) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let log_path = state.log_path.clone();
+    let php_install_dir = state
+        .php
+        .lock()
+        .map_err(|_| "failed to lock php state".to_string())?
+        .install_dir
+        .clone();
+    let mut guard = state
+        .mariadb
+        .lock()
+        .map_err(|_| "failed to lock mariadb state".to_string())?;
+    ensure_mariadb_config_defaults(&mut guard.config);
+    let latest = latest_mariadb_builds_with_fallback(&guard.cache_path);
+    let build = latest
+        .get(line)
+        .cloned()
+        .ok_or_else(|| format!("could not find latest Windows x64 build for MariaDB {line}"))?;
+    let had_current_before = guard
+        .config
+        .current_line
+        .as_ref()
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false);
+    append_runtime_log(
+        &log_path,
+        "INFO",
+        "tray.mysql.install",
+        &format!("Installing MariaDB line {line} ({})", build.version),
+    );
+    install_mariadb_line_build_with_progress(&guard.install_dir, line, &build, |_| {})?;
+    apply_mariadb_config_to_line(&guard.install_dir, &guard.template_dir, line, &guard.config)?;
+    guard
+        .config
+        .installed
+        .insert(line.to_string(), vec![build.version.clone()]);
+    if !had_current_before {
+        guard.config.current_line = Some(line.to_string());
+    }
+    if let Some(current_line) = guard.config.current_line.clone() {
+        set_mariadb_current_link(&guard.install_dir, &current_line)?;
+    }
+    save_mariadb_config(&guard.config_path, &guard.config)?;
+    let _ = refresh_user_path_with_runtime_currents(&php_install_dir, &guard.install_dir);
+    append_runtime_log(
+        &log_path,
+        "INFO",
+        "tray.mysql.install",
+        &format!("MariaDB line {line} installed"),
+    );
+    Ok(())
+}
+
+fn tray_node_install_major(app: &tauri::AppHandle, major: &str) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let log_path = state.log_path.clone();
+    let catalog = build_node_catalog();
+    if !catalog.nvm_available {
+        return Err(catalog
+            .error
+            .unwrap_or_else(|| "Node runtime manager is not available".to_string()));
+    }
+    let target = catalog
+        .runtimes
+        .iter()
+        .find(|runtime| runtime.line == major)
+        .and_then(|runtime| runtime.latest_version.clone())
+        .ok_or_else(|| format!("no available Node version found for major {major}"))?;
+    let first_install = catalog.installed_versions.is_empty();
+    append_runtime_log(
+        &log_path,
+        "INFO",
+        "tray.node.install",
+        &format!("Running: nvm install {target}"),
+    );
+    run_nvm_command(&["install", &target])?;
+    if first_install {
+        append_runtime_log(
+            &log_path,
+            "INFO",
+            "tray.node.install",
+            &format!("First Node install detected, running: nvm use {target}"),
+        );
+        run_nvm_command(&["use", &target])?;
+    }
+    let php_install_dir = state
+        .php
+        .lock()
+        .map_err(|_| "failed to lock php state".to_string())?
+        .install_dir
+        .clone();
+    let mariadb_install_dir = state
+        .mariadb
+        .lock()
+        .map_err(|_| "failed to lock mariadb state".to_string())?
+        .install_dir
+        .clone();
+    let _ = refresh_user_path_with_runtime_currents(&php_install_dir, &mariadb_install_dir);
+    append_runtime_log(
+        &log_path,
+        "INFO",
+        "tray.node.install",
+        &format!("Node major {major} installed (target {target})"),
+    );
+    Ok(())
+}
+
+fn tray_set_all_sites_ssl(app: &tauri::AppHandle, ssl_enabled: bool) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let log_path = state.log_path.clone();
+    let (sites, php_install_dir, php_base_port) = {
+        let mut sites_guard = state
+            .sites
+            .lock()
+            .map_err(|_| "failed to lock sites state".to_string())?;
+        for site in &mut sites_guard.store.sites {
+            site.ssl_enabled = ssl_enabled;
+        }
+        save_sites_store(&sites_guard.path, &sites_guard.store)?;
+        let cloned_sites = sorted_sites(&sites_guard.store);
+        drop(sites_guard);
+
+        let php_guard = state
+            .php
+            .lock()
+            .map_err(|_| "failed to lock php state".to_string())?;
+        (cloned_sites, php_guard.install_dir.clone(), php_guard.config.base_port)
+    };
+
+    let bin_root = php_install_dir
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| php_install_dir.clone());
+    let nginx_root = bin_root.join("nginx");
+    let sites_dir = resolve_sites_dir_from_php_install_dir(&php_install_dir);
+
+    for site in &sites {
+        let fpm_port = line_port(php_base_port, &site.php_version);
+        let site_path = PathBuf::from(&site.path);
+        write_nginx_site_config(
+            &nginx_root,
+            &sites_dir,
+            &site.domain,
+            &site_path,
+            fpm_port,
+            ssl_enabled,
+        )?;
+        if !site.linked {
+            let _ = set_project_app_url(&site_path, &site.domain, ssl_enabled);
+        }
+    }
+    let domains: Vec<String> = sites.iter().map(|s| s.domain.clone()).collect();
+    let _ = reconcile_nginx_site_configs(&sites_dir, &domains);
+    sync_hosts_block(domains, &sites_dir)?;
+    let _ = reload_nginx_if_running(&nginx_root);
+    append_runtime_log(
+        &log_path,
+        "INFO",
+        "tray.nginx.ssl_all",
+        &format!("Set SSL={} for all sites", ssl_enabled),
+    );
+    Ok(())
+}
+
+fn menu_item_simple(app: &tauri::AppHandle, id: impl Into<String>, text: impl AsRef<str>, enabled: bool) -> Result<MenuItem<tauri::Wry>, String> {
+    MenuItem::with_id(app, id.into(), text.as_ref(), enabled, None::<&str>)
+        .map_err(|e| format!("failed to create menu item '{}': {e}", text.as_ref()))
+}
+
+fn menu_separator(app: &tauri::AppHandle) -> Result<PredefinedMenuItem<tauri::Wry>, String> {
+    PredefinedMenuItem::separator(app).map_err(|e| format!("failed to create separator: {e}"))
+}
+
+fn build_systray_menu(app: &tauri::AppHandle) -> Result<Menu<tauri::Wry>, String> {
+    let state = app.state::<AppState>();
+    let (sites_snapshot, php_install_dir, php_config, mariadb_install_dir, mariadb_config, runtime_log_path) = {
+        let sites_guard = state
+            .sites
+            .lock()
+            .map_err(|_| "failed to lock sites state".to_string())?;
+        let php_guard = state
+            .php
+            .lock()
+            .map_err(|_| "failed to lock php state".to_string())?;
+        let mariadb_guard = state
+            .mariadb
+            .lock()
+            .map_err(|_| "failed to lock mariadb state".to_string())?;
+        (
+            sorted_sites(&sites_guard.store),
+            php_guard.install_dir.clone(),
+            php_guard.config.clone(),
+            mariadb_guard.install_dir.clone(),
+            mariadb_guard.config.clone(),
+            state.log_path.clone(),
+        )
+    };
+    let node_catalog = build_node_catalog();
+    let bin_root = php_install_dir
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| php_install_dir.clone());
+    let logs_dir = resolve_logs_dir_from_bin_root(&bin_root);
+    let sites_dir = resolve_sites_dir_from_php_install_dir(&php_install_dir);
+    let nginx_root = bin_root.join("nginx");
+
+    let menu = Menu::new(app).map_err(|e| format!("failed to create tray menu: {e}"))?;
+
+    let title = menu_item_simple(
+        app,
+        "tray.title",
+        format!("Envloom v{}", env!("CARGO_PKG_VERSION")),
+        false,
+    )?;
+    menu.append(&title).map_err(|e| e.to_string())?;
+
+    let sites_menu = Submenu::new(app, "Sites", true).map_err(|e| format!("failed to create sites submenu: {e}"))?;
+    let linked_sites: Vec<SiteRecord> = sites_snapshot.into_iter().filter(|s| s.linked).collect();
+    if linked_sites.is_empty() {
+        let none_item = menu_item_simple(app, "tray.sites.none", "No linked sites", false)?;
+        sites_menu.append(&none_item).map_err(|e| e.to_string())?;
+    } else {
+        for site in linked_sites {
+            let label = if site.ssl_enabled {
+                format!("{} (SSL)", site.domain)
+            } else {
+                site.domain.clone()
+            };
+            let item = menu_item_simple(app, format!("tray.site.open:{}", site.id), label, true)?;
+            sites_menu.append(&item).map_err(|e| e.to_string())?;
+        }
+    }
+    menu.append(&sites_menu).map_err(|e| e.to_string())?;
+
+    let sep1 = menu_separator(app)?;
+    menu.append(&sep1).map_err(|e| e.to_string())?;
+
+    let php_menu = Submenu::new(app, "PHP", true).map_err(|e| format!("failed to create PHP submenu: {e}"))?;
+    let php_current_label = php_config
+        .current_line
+        .as_ref()
+        .map(|line| {
+            let active = php_config.active.get(line).cloned().unwrap_or_else(|| line.clone());
+            format!("Current: PHP {line} ({active})")
+        })
+        .unwrap_or_else(|| "Current: not selected".to_string());
+    let php_current = menu_item_simple(app, "tray.php.current_label", php_current_label, false)?;
+    php_menu.append(&php_current).map_err(|e| e.to_string())?;
+    let php_switch = Submenu::new(app, "Switch version", true).map_err(|e| e.to_string())?;
+    let mut php_lines: Vec<String> = php_config
+        .installed
+        .iter()
+        .filter_map(|(line, versions)| (!versions.is_empty()).then_some(line.clone()))
+        .collect();
+    php_lines.sort();
+    if php_lines.is_empty() {
+        let none = menu_item_simple(app, "tray.php.switch.none", "No installed PHP versions", false)?;
+        php_switch.append(&none).map_err(|e| e.to_string())?;
+    } else {
+        for line in php_lines {
+            let marker = if php_config.current_line.as_deref() == Some(line.as_str()) { " (current)" } else { "" };
+            let item = menu_item_simple(app, format!("tray.php.current:{line}"), format!("PHP {line}{marker}"), true)?;
+            php_switch.append(&item).map_err(|e| e.to_string())?;
+        }
+    }
+    php_menu.append(&php_switch).map_err(|e| e.to_string())?;
+    let php_add = Submenu::new(app, "Add version", true).map_err(|e| e.to_string())?;
+    let latest_php = latest_builds_with_fallback(&state.php.lock().map_err(|_| "failed to lock php state".to_string())?.cache_path);
+    let mut php_available_lines: Vec<String> = latest_php.keys().cloned().collect();
+    php_available_lines.sort();
+    let mut php_add_count = 0usize;
+    for line in php_available_lines {
+        let installed = php_config
+            .installed
+            .get(&line)
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
+        if installed {
+            continue;
+        }
+        php_add_count += 1;
+        let label = latest_php
+            .get(&line)
+            .map(|b| format!("PHP {} ({})", line, b.version))
+            .unwrap_or_else(|| format!("PHP {line}"));
+        let item = menu_item_simple(app, format!("tray.php.install:{line}"), label, true)?;
+        php_add.append(&item).map_err(|e| e.to_string())?;
+    }
+    if php_add_count == 0 {
+        let none = menu_item_simple(app, "tray.php.install.none", "No additional PHP versions available", false)?;
+        php_add.append(&none).map_err(|e| e.to_string())?;
+    }
+    php_menu.append(&php_add).map_err(|e| e.to_string())?;
+    let php_ini_item = menu_item_simple(app, TRAY_MENU_OPEN_PHP_INI, "php.ini", true)?;
+    php_menu.append(&php_ini_item).map_err(|e| e.to_string())?;
+    let php_dir = Submenu::new(app, "Dir", true).map_err(|e| e.to_string())?;
+    let php_ext = menu_item_simple(app, TRAY_MENU_OPEN_PHP_EXT_DIR, "Extensions", true)?;
+    let php_logs = menu_item_simple(app, TRAY_MENU_OPEN_PHP_LOGS_DIR, "Logs", true)?;
+    php_dir.append(&php_ext).map_err(|e| e.to_string())?;
+    php_dir.append(&php_logs).map_err(|e| e.to_string())?;
+    php_menu.append(&php_dir).map_err(|e| e.to_string())?;
+    menu.append(&php_menu).map_err(|e| e.to_string())?;
+
+    let nginx_menu = Submenu::new(app, "Nginx", true).map_err(|e| e.to_string())?;
+    let nginx_version = detect_nginx_version_from_binary(&nginx_root).unwrap_or_else(|| "-".to_string());
+    let nginx_title = menu_item_simple(app, "tray.nginx.version_label", format!("Current: {nginx_version}"), false)?;
+    nginx_menu.append(&nginx_title).map_err(|e| e.to_string())?;
+    let ssl_sub = Submenu::new(app, "SSL", true).map_err(|e| e.to_string())?;
+    let ssl_on = menu_item_simple(app, TRAY_MENU_SSL_ALL_ON, "Enable for all sites", true)?;
+    let ssl_off = menu_item_simple(app, TRAY_MENU_SSL_ALL_OFF, "Disable for all sites", true)?;
+    ssl_sub.append(&ssl_on).map_err(|e| e.to_string())?;
+    ssl_sub.append(&ssl_off).map_err(|e| e.to_string())?;
+    nginx_menu.append(&ssl_sub).map_err(|e| e.to_string())?;
+    let nginx_configs = Submenu::new(app, "Configs", true).map_err(|e| e.to_string())?;
+    let open_configs_dir = menu_item_simple(app, TRAY_MENU_OPEN_NGINX_CONFIGS_DIR, "Open configs folder", true)?;
+    nginx_configs.append(&open_configs_dir).map_err(|e| e.to_string())?;
+    let nginx_sites: Vec<SiteRecord> = {
+        let state = app.state::<AppState>();
+        let guard = state.sites.lock().map_err(|_| "failed to lock sites state".to_string())?;
+        sorted_sites(&guard.store)
+    };
+    if nginx_sites.is_empty() {
+        let none = menu_item_simple(app, "tray.nginx.config.none", "No sites", false)?;
+        nginx_configs.append(&none).map_err(|e| e.to_string())?;
+    } else {
+        for site in nginx_sites {
+            let item = menu_item_simple(
+                app,
+                format!("tray.nginx.config.site:{}", site.id),
+                site.domain,
+                true,
+            )?;
+            nginx_configs.append(&item).map_err(|e| e.to_string())?;
+        }
+    }
+    nginx_menu.append(&nginx_configs).map_err(|e| e.to_string())?;
+    let nginx_logs = Submenu::new(app, "Logs", true).map_err(|e| e.to_string())?;
+    let nginx_access = menu_item_simple(app, TRAY_MENU_OPEN_NGINX_ACCESS_LOG, "access.log", true)?;
+    let nginx_error = menu_item_simple(app, TRAY_MENU_OPEN_NGINX_ERROR_LOG, "error.log", true)?;
+    nginx_logs.append(&nginx_access).map_err(|e| e.to_string())?;
+    nginx_logs.append(&nginx_error).map_err(|e| e.to_string())?;
+    nginx_menu.append(&nginx_logs).map_err(|e| e.to_string())?;
+    menu.append(&nginx_menu).map_err(|e| e.to_string())?;
+
+    let mysql_menu = Submenu::new(app, "MySQL", true).map_err(|e| e.to_string())?;
+    let mysql_current = mariadb_config
+        .current_line
+        .as_ref()
+        .map(|line| {
+            let version = mariadb_config
+                .installed
+                .get(line)
+                .and_then(|v| v.first())
+                .cloned()
+                .unwrap_or_else(|| line.clone());
+            format!("Current: MariaDB {line} ({version})")
+        })
+        .unwrap_or_else(|| "Current: not selected".to_string());
+    let mysql_title = menu_item_simple(app, "tray.mysql.current_label", mysql_current, false)?;
+    mysql_menu.append(&mysql_title).map_err(|e| e.to_string())?;
+    let mysql_switch = Submenu::new(app, "Switch version", true).map_err(|e| e.to_string())?;
+    let mut mariadb_lines: Vec<String> = mariadb_config
+        .installed
+        .iter()
+        .filter_map(|(line, versions)| (!versions.is_empty()).then_some(line.clone()))
+        .collect();
+    mariadb_lines.sort();
+    if mariadb_lines.is_empty() {
+        let none = menu_item_simple(app, "tray.mysql.switch.none", "No installed MariaDB versions", false)?;
+        mysql_switch.append(&none).map_err(|e| e.to_string())?;
+    } else {
+        for line in mariadb_lines {
+            let marker = if mariadb_config.current_line.as_deref() == Some(line.as_str()) {
+                " (current)"
+            } else {
+                ""
+            };
+            let item = menu_item_simple(app, format!("tray.mysql.current:{line}"), format!("MariaDB {line}{marker}"), true)?;
+            mysql_switch.append(&item).map_err(|e| e.to_string())?;
+        }
+    }
+    mysql_menu.append(&mysql_switch).map_err(|e| e.to_string())?;
+    let mysql_add = Submenu::new(app, "Add version", true).map_err(|e| e.to_string())?;
+    let latest_mariadb = latest_mariadb_builds_with_fallback(
+        &state
+            .mariadb
+            .lock()
+            .map_err(|_| "failed to lock mariadb state".to_string())?
+            .cache_path,
+    );
+    let mut mariadb_available_lines: Vec<String> = latest_mariadb.keys().cloned().collect();
+    mariadb_available_lines.sort();
+    let mut mysql_add_count = 0usize;
+    for line in mariadb_available_lines {
+        let installed = mariadb_config
+            .installed
+            .get(&line)
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
+        if installed {
+            continue;
+        }
+        mysql_add_count += 1;
+        let label = latest_mariadb
+            .get(&line)
+            .map(|b| format!("MariaDB {} ({})", line, b.version))
+            .unwrap_or_else(|| format!("MariaDB {line}"));
+        let item = menu_item_simple(app, format!("tray.mysql.install:{line}"), label, true)?;
+        mysql_add.append(&item).map_err(|e| e.to_string())?;
+    }
+    if mysql_add_count == 0 {
+        let none = menu_item_simple(app, "tray.mysql.install.none", "No additional MariaDB versions available", false)?;
+        mysql_add.append(&none).map_err(|e| e.to_string())?;
+    }
+    mysql_menu.append(&mysql_add).map_err(|e| e.to_string())?;
+    menu.append(&mysql_menu).map_err(|e| e.to_string())?;
+
+    let node_menu = Submenu::new(app, "Node", true).map_err(|e| e.to_string())?;
+    let node_current = node_catalog
+        .current_version
+        .clone()
+        .map(|v| format!("Current: Node {v}"))
+        .unwrap_or_else(|| "Current: not selected".to_string());
+    let node_title = menu_item_simple(app, "tray.node.current_label", node_current, false)?;
+    node_menu.append(&node_title).map_err(|e| e.to_string())?;
+    let node_switch = Submenu::new(app, "Switch version", true).map_err(|e| e.to_string())?;
+    if node_catalog.installed_versions.is_empty() {
+        let none = menu_item_simple(app, "tray.node.switch.none", "No installed Node versions", false)?;
+        node_switch.append(&none).map_err(|e| e.to_string())?;
+    } else {
+        for version in &node_catalog.installed_versions {
+            let marker = if node_catalog.current_version.as_deref() == Some(version.as_str()) {
+                " (current)"
+            } else {
+                ""
+            };
+            let item = menu_item_simple(app, format!("tray.node.current:{version}"), format!("Node {version}{marker}"), true)?;
+            node_switch.append(&item).map_err(|e| e.to_string())?;
+        }
+    }
+    node_menu.append(&node_switch).map_err(|e| e.to_string())?;
+    let node_add = Submenu::new(app, "Add version", true).map_err(|e| e.to_string())?;
+    let mut node_add_count = 0usize;
+    for runtime in &node_catalog.runtimes {
+        let already_installed = runtime
+            .installed_version
+            .as_ref()
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false);
+        if already_installed {
+            continue;
+        }
+        node_add_count += 1;
+        let label = runtime
+            .latest_version
+            .as_ref()
+            .map(|v| format!("Node {} ({v})", runtime.line))
+            .unwrap_or_else(|| format!("Node {}", runtime.line));
+        let item = menu_item_simple(app, format!("tray.node.install:{}", runtime.line), label, true)?;
+        node_add.append(&item).map_err(|e| e.to_string())?;
+    }
+    if node_add_count == 0 {
+        let none = menu_item_simple(app, "tray.node.install.none", "No additional Node versions available", false)?;
+        node_add.append(&none).map_err(|e| e.to_string())?;
+    }
+    node_menu.append(&node_add).map_err(|e| e.to_string())?;
+    menu.append(&node_menu).map_err(|e| e.to_string())?;
+
+    let sep2 = menu_separator(app)?;
+    menu.append(&sep2).map_err(|e| e.to_string())?;
+
+    let start_item = menu_item_simple(app, TRAY_MENU_START_ALL, "Start all", true)?;
+    let stop_item = menu_item_simple(app, TRAY_MENU_STOP_ALL, "Stop all", true)?;
+    let reload_item = menu_item_simple(app, TRAY_MENU_RELOAD_ALL, "Reload all", true)?;
+    menu.append(&start_item).map_err(|e| e.to_string())?;
+    menu.append(&stop_item).map_err(|e| e.to_string())?;
+    menu.append(&reload_item).map_err(|e| e.to_string())?;
+
+    let sep3 = menu_separator(app)?;
+    menu.append(&sep3).map_err(|e| e.to_string())?;
+
+    let quit_item = menu_item_simple(app, TRAY_MENU_QUIT, "Quit", true)?;
+    menu.append(&quit_item).map_err(|e| e.to_string())?;
+
+    let _ = runtime_log_path;
+    let _ = mariadb_install_dir;
+    let _ = logs_dir;
+    let _ = sites_dir;
+    Ok(menu)
+}
+
+fn refresh_systray_menu(app: &tauri::AppHandle) -> Result<(), String> {
+    let menu = build_systray_menu(app)?;
+    let tray = app
+        .tray_by_id("envloom-tray")
+        .ok_or_else(|| "tray not found".to_string())?;
+    tray.set_menu(Some(menu))
+        .map_err(|e| format!("failed to update tray menu: {e}"))
+}
+
+fn handle_tray_menu_click(app_handle: &tauri::AppHandle, event_id: &str) {
+    let log_path = app_handle.state::<AppState>().log_path.clone();
+    let run_async_action = |scope: &'static str, action: Box<dyn FnOnce() -> Result<(), String> + Send>| {
+        let app = app_handle.clone();
+        let log_path = log_path.clone();
+        std::thread::spawn(move || {
+            if let Err(error) = action() {
+                append_runtime_log(&log_path, "ERROR", scope, &error);
+            }
+            let _ = refresh_systray_menu(&app);
+        });
+    };
+
+    match event_id {
+        TRAY_MENU_OPEN => {
+            if let Err(error) = show_main_window(app_handle) {
+                append_runtime_log(&log_path, "ERROR", "tray.open", &error);
+            }
+        }
+        TRAY_MENU_START_ALL => run_async_action("tray.start_all", Box::new({
+            let app = app_handle.clone();
+            move || tray_start_all_services(&app)
+        })),
+        TRAY_MENU_STOP_ALL => run_async_action("tray.stop_all", Box::new({
+            let app = app_handle.clone();
+            move || tray_stop_all_services(&app)
+        })),
+        TRAY_MENU_RELOAD_ALL => run_async_action("tray.reload_all", Box::new({
+            let app = app_handle.clone();
+            move || tray_reload_all_services(&app)
+        })),
+        TRAY_MENU_SSL_ALL_ON => run_async_action("tray.nginx.ssl_all", Box::new({
+            let app = app_handle.clone();
+            move || tray_set_all_sites_ssl(&app, true)
+        })),
+        TRAY_MENU_SSL_ALL_OFF => run_async_action("tray.nginx.ssl_all", Box::new({
+            let app = app_handle.clone();
+            move || tray_set_all_sites_ssl(&app, false)
+        })),
+        TRAY_MENU_OPEN_PHP_INI => {
+            let state = app_handle.state::<AppState>();
+            let php_dir = match state.php.lock() {
+                Ok(g) => g.install_dir.clone(),
+                Err(_) => return,
+            };
+            let _ = tray_open_path(app_handle, &php_dir.join("current").join("php.ini"));
+        }
+        TRAY_MENU_OPEN_PHP_EXT_DIR => {
+            let state = app_handle.state::<AppState>();
+            let php_dir = match state.php.lock() {
+                Ok(g) => g.install_dir.clone(),
+                Err(_) => return,
+            };
+            let _ = tray_open_path(app_handle, &php_dir.join("current").join("ext"));
+        }
+        TRAY_MENU_OPEN_PHP_LOGS_DIR => {
+            let state = app_handle.state::<AppState>();
+            let php_dir = match state.php.lock() {
+                Ok(g) => g.install_dir.clone(),
+                Err(_) => return,
+            };
+            let bin_root = php_dir.parent().map(Path::to_path_buf).unwrap_or(php_dir);
+            let path = resolve_logs_dir_from_bin_root(&bin_root).join("php");
+            let _ = tray_open_path(app_handle, &path);
+        }
+        TRAY_MENU_OPEN_NGINX_ACCESS_LOG => {
+            let state = app_handle.state::<AppState>();
+            let php_dir = match state.php.lock() {
+                Ok(g) => g.install_dir.clone(),
+                Err(_) => return,
+            };
+            let bin_root = php_dir.parent().map(Path::to_path_buf).unwrap_or(php_dir);
+            let path = resolve_logs_dir_from_bin_root(&bin_root).join("nginx").join("access.log");
+            let _ = tray_open_path(app_handle, &path);
+        }
+        TRAY_MENU_OPEN_NGINX_ERROR_LOG => {
+            let state = app_handle.state::<AppState>();
+            let php_dir = match state.php.lock() {
+                Ok(g) => g.install_dir.clone(),
+                Err(_) => return,
+            };
+            let bin_root = php_dir.parent().map(Path::to_path_buf).unwrap_or(php_dir);
+            let path = resolve_logs_dir_from_bin_root(&bin_root).join("nginx").join("error.log");
+            let _ = tray_open_path(app_handle, &path);
+        }
+        TRAY_MENU_OPEN_NGINX_CONFIGS_DIR => {
+            let state = app_handle.state::<AppState>();
+            let php_dir = match state.php.lock() {
+                Ok(g) => g.install_dir.clone(),
+                Err(_) => return,
+            };
+            let path = resolve_sites_dir_from_php_install_dir(&php_dir);
+            let _ = tray_open_path(app_handle, &path);
+        }
+        TRAY_MENU_QUIT => app_handle.exit(0),
+        _ => {
+            if let Some(site_id) = event_id.strip_prefix("tray.site.open:") {
+                let state = app_handle.state::<AppState>();
+                let site = state
+                    .sites
+                    .lock()
+                    .ok()
+                    .and_then(|g| g.store.sites.iter().find(|s| s.id == site_id).cloned());
+                if let Some(site) = site {
+                    let scheme = if site.ssl_enabled { "https" } else { "http" };
+                    let _ = tray_open_url(app_handle, &format!("{scheme}://{}", site.domain));
+                }
+                return;
+            }
+            if let Some(site_id) = event_id.strip_prefix("tray.nginx.config.site:") {
+                let state = app_handle.state::<AppState>();
+                let (site, php_dir) = match (state.sites.lock(), state.php.lock()) {
+                    (Ok(sites), Ok(php)) => (
+                        sites.store.sites.iter().find(|s| s.id == site_id).cloned(),
+                        php.install_dir.clone(),
+                    ),
+                    _ => return,
+                };
+                if let Some(site) = site {
+                    let path = resolve_sites_dir_from_php_install_dir(&php_dir).join(format!("{}.conf", site.domain));
+                    let _ = tray_open_path(app_handle, &path);
+                }
+                return;
+            }
+            if let Some(line) = event_id.strip_prefix("tray.php.current:") {
+                run_async_action("tray.php.current", Box::new({
+                    let app = app_handle.clone();
+                    let line = line.to_string();
+                    move || tray_php_set_current_line(&app, &line)
+                }));
+                return;
+            }
+            if let Some(line) = event_id.strip_prefix("tray.php.install:") {
+                run_async_action("tray.php.install", Box::new({
+                    let app = app_handle.clone();
+                    let line = line.to_string();
+                    move || tray_php_install_latest_line(&app, &line)
+                }));
+                return;
+            }
+            if let Some(line) = event_id.strip_prefix("tray.mysql.current:") {
+                run_async_action("tray.mysql.current", Box::new({
+                    let app = app_handle.clone();
+                    let line = line.to_string();
+                    move || tray_mariadb_set_current_line(&app, &line)
+                }));
+                return;
+            }
+            if let Some(line) = event_id.strip_prefix("tray.mysql.install:") {
+                run_async_action("tray.mysql.install", Box::new({
+                    let app = app_handle.clone();
+                    let line = line.to_string();
+                    move || tray_mariadb_install_latest_line(&app, &line)
+                }));
+                return;
+            }
+            if let Some(version) = event_id.strip_prefix("tray.node.current:") {
+                run_async_action("tray.node.current", Box::new({
+                    let app = app_handle.clone();
+                    let version = version.to_string();
+                    move || tray_node_set_current_version(&app, &version)
+                }));
+                return;
+            }
+            if let Some(major) = event_id.strip_prefix("tray.node.install:") {
+                run_async_action("tray.node.install", Box::new({
+                    let app = app_handle.clone();
+                    let major = major.to_string();
+                    move || tray_node_install_major(&app, &major)
+                }));
+            }
+        }
+    }
+}
+
+fn build_systray(app: &tauri::AppHandle) -> Result<(), String> {
+    let menu = build_systray_menu(app)?;
+    let mut tray_builder = TrayIconBuilder::with_id("envloom-tray")
+        .menu(&menu)
+        .tooltip("Envloom")
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app_handle, event: MenuEvent| {
+            handle_tray_menu_click(app_handle, event.id().as_ref());
+        })
+        .on_tray_icon_event(|tray: &TrayIcon<_>, event: TrayIconEvent| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                let _ = show_main_window(tray.app_handle());
+            }
+        });
+
+    if let Ok(icon) = tauri::image::Image::from_bytes(include_bytes!("../icons/icon.png")) {
+        tray_builder = tray_builder.icon(icon);
+    }
+
+    tray_builder
+        .build(app)
+        .map_err(|e| format!("failed to build tray icon: {e}"))?;
+    Ok(())
+}
+
+fn cli_bin_root() -> Result<PathBuf, String> {
+    if cfg!(debug_assertions) {
+        Ok(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("bin"))
+    } else {
+        let exe = std::env::current_exe().map_err(|e| format!("failed to resolve current exe: {e}"))?;
+        let dir = exe
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| "failed to resolve executable directory".to_string())?;
+        Ok(dir.join("bin"))
+    }
+}
+
+fn cli_php_current_line(bin_root: &Path) -> Option<String> {
+    let config_path = bin_root.join("php").join("_state.json");
+    let mut config = load_php_config(&config_path);
+    ensure_php_config_defaults(&mut config);
+    config.current_line
+}
+
+fn cli_mariadb_current_line(bin_root: &Path) -> Option<String> {
+    let config_path = bin_root.join("mariadb").join("_state.json");
+    let mut config = load_mariadb_config(&config_path);
+    ensure_mariadb_config_defaults(&mut config);
+    config.current_line
+}
+
+fn cli_php_installed_lines(bin_root: &Path) -> Vec<String> {
+    let config_path = bin_root.join("php").join("_state.json");
+    let install_dir = bin_root.join("php");
+    let mut config = load_php_config(&config_path);
+    ensure_php_config_defaults(&mut config);
+    let _ = sync_local_php_installations(&install_dir, &mut config);
+    let mut lines: Vec<String> = config
+        .installed
+        .iter()
+        .filter_map(|(line, versions)| (!versions.is_empty()).then_some(line.clone()))
+        .collect();
+    lines.sort();
+    lines
+}
+
+fn cli_mariadb_installed_lines(bin_root: &Path) -> Vec<String> {
+    let config_path = bin_root.join("mariadb").join("_state.json");
+    let install_dir = bin_root.join("mariadb");
+    let mut config = load_mariadb_config(&config_path);
+    ensure_mariadb_config_defaults(&mut config);
+    let _ = sync_local_mariadb_installations(&install_dir, &mut config);
+    let mut lines: Vec<String> = config
+        .installed
+        .iter()
+        .filter_map(|(line, versions)| (!versions.is_empty()).then_some(line.clone()))
+        .collect();
+    lines.sort();
+    lines
+}
+
+fn cli_print_usage() {
+    eprintln!("Envloom CLI (loom)");
+    eprintln!("Usage:");
+    eprintln!("  loom -h | --help");
+    eprintln!("  loom current");
+    eprintln!("  loom list <php|node|mysql|mariadb|nginx>");
+    eprintln!("  loom link <php-line>");
+    eprintln!("  loom unlink");
+    eprintln!("  loom ssl <on|off>");
+    eprintln!("  loom php <version>");
+    eprintln!("  loom node <version|major>");
+}
+
+fn cli_local_app_data_dir() -> Result<PathBuf, String> {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .or_else(|| std::env::var_os("APPDATA"))
+        .map(PathBuf::from)
+        .ok_or_else(|| "failed to resolve LOCALAPPDATA/APPDATA".to_string())?;
+    Ok(base.join("Envloom"))
+}
+
+fn cli_sites_store_path() -> Result<PathBuf, String> {
+    Ok(cli_local_app_data_dir()?.join("sites.json"))
+}
+
+fn cli_current_project_path() -> Result<PathBuf, String> {
+    std::env::current_dir().map_err(|e| format!("failed to resolve current directory: {e}"))
+}
+
+fn cli_domain_from_path(path: &Path) -> Result<String, String> {
+    let name = path
+        .file_name()
+        .and_then(|v| v.to_str())
+        .ok_or_else(|| "failed to derive folder name for domain".to_string())?
+        .trim()
+        .to_lowercase();
+    if name.is_empty() {
+        return Err("current folder name is empty".to_string());
+    }
+    let sanitized: String = name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
+        .collect();
+    let collapsed = sanitized
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    if collapsed.is_empty() {
+        return Err("failed to derive a valid domain from folder name".to_string());
+    }
+    Ok(format!("{collapsed}.test"))
+}
+
+fn cli_load_sites_store() -> Result<(PathBuf, SiteStore), String> {
+    let path = cli_sites_store_path()?;
+    Ok((path.clone(), load_sites_store(&path)))
+}
+
+fn cli_find_site_by_path(store: &SiteStore, path: &Path) -> Option<SiteRecord> {
+    let path_norm = path.to_string_lossy().replace('\\', "/").to_lowercase();
+    store
+        .sites
+        .iter()
+        .find(|site| site.path.replace('\\', "/").to_lowercase() == path_norm)
+        .cloned()
+}
+
+fn cli_link_current_project(php_line: &str) -> Result<(), String> {
+    let cwd = cli_current_project_path()?;
+    let domain = cli_domain_from_path(&cwd)?;
+    let node_version = node_current_version_light()
+        .ok_or_else(|| "no current Node version selected. Run `loom node <version>` first.".to_string())?;
+    let (sites_path, mut store) = cli_load_sites_store()?;
+    if let Some(existing) = cli_find_site_by_path(&store, &cwd) {
+        return Err(format!("this project is already linked as {}", existing.domain));
+    }
+    if store
+        .sites
+        .iter()
+        .any(|site| site.domain.eq_ignore_ascii_case(&domain))
+    {
+        return Err(format!("site domain already exists: {domain}"));
+    }
+
+    let bin_root = cli_bin_root()?;
+    let php_install_dir = bin_root.join("php");
+    let mariadb_install_dir = bin_root.join("mariadb");
+    let mut php_config = load_php_config(&php_install_dir.join("_state.json"));
+    ensure_php_config_defaults(&mut php_config);
+    sync_local_php_installations(&php_install_dir, &mut php_config)?;
+    let installed = php_config.installed.get(php_line).cloned().unwrap_or_default();
+    if installed.is_empty() {
+        return Err(format!("php line {php_line} is not installed"));
+    }
+
+    let site_name = cwd
+        .file_name()
+        .and_then(|v| v.to_str())
+        .unwrap_or("site")
+        .to_string();
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| format!("failed to read clock: {e}"))?
+        .as_millis();
+    let id = format!("{}-{timestamp}", domain.replace('.', "-"));
+    let site = SiteRecord {
+        id,
+        name: site_name,
+        domain: domain.clone(),
+        linked: true,
+        ssl_enabled: true,
+        path: cwd.to_string_lossy().to_string(),
+        php_version: php_line.to_string(),
+        node_version,
+        starter_kit: None,
+    };
+    store.sites.push(site.clone());
+    save_sites_store(&sites_path, &store)?;
+
+    let fpm_port = line_port(php_config.base_port, php_line);
+    let nginx_root = bin_root.join("nginx");
+    let sites_dir = resolve_sites_dir_from_php_install_dir(&php_install_dir);
+    write_nginx_site_config(&nginx_root, &sites_dir, &site.domain, &cwd, fpm_port, true)?;
+    let domains: Vec<String> = sorted_sites(&store).into_iter().map(|s| s.domain).collect();
+    let _ = reconcile_nginx_site_configs(&sites_dir, &domains);
+    sync_hosts_block(domains, &sites_dir)?;
+    let _ = reload_nginx_if_running(&nginx_root);
+    let _ = refresh_user_path_with_runtime_currents(&php_install_dir, &mariadb_install_dir);
+
+    let log_path = resolve_logs_dir_from_bin_root(&bin_root).join("runtime.log");
+    append_runtime_log(
+        &log_path,
+        "INFO",
+        "cli.link",
+        &format!("Linked {} -> {}", site.domain, cwd.display()),
+    );
+    println!("Linked {} -> {}", site.domain, cwd.display());
+    Ok(())
+}
+
+fn cli_unlink_current_project() -> Result<(), String> {
+    let cwd = cli_current_project_path()?;
+    let (sites_path, mut store) = cli_load_sites_store()?;
+    let site = cli_find_site_by_path(&store, &cwd)
+        .ok_or_else(|| "current directory is not linked in Envloom".to_string())?;
+    store.sites.retain(|s| s.id != site.id);
+    save_sites_store(&sites_path, &store)?;
+
+    let bin_root = cli_bin_root()?;
+    let php_install_dir = bin_root.join("php");
+    let sites_dir = resolve_sites_dir_from_php_install_dir(&php_install_dir);
+    let domains: Vec<String> = sorted_sites(&store).into_iter().map(|s| s.domain).collect();
+    let _ = reconcile_nginx_site_configs(&sites_dir, &domains);
+    sync_hosts_block(domains, &sites_dir)?;
+    let _ = reload_nginx_if_running(&bin_root.join("nginx"));
+
+    let log_path = resolve_logs_dir_from_bin_root(&bin_root).join("runtime.log");
+    append_runtime_log(
+        &log_path,
+        "INFO",
+        "cli.unlink",
+        &format!("Unlinked {} ({})", site.domain, cwd.display()),
+    );
+    println!("Unlinked {}", site.domain);
+    Ok(())
+}
+
+fn cli_set_ssl_for_current_project(enabled: bool) -> Result<(), String> {
+    let cwd = cli_current_project_path()?;
+    let (sites_path, mut store) = cli_load_sites_store()?;
+    let Some(target) = store
+        .sites
+        .iter_mut()
+        .find(|s| s.path.replace('\\', "/").eq_ignore_ascii_case(&cwd.to_string_lossy().replace('\\', "/")))
+    else {
+        return Err("current directory is not linked in Envloom".to_string());
+    };
+    target.ssl_enabled = enabled;
+    let site = target.clone();
+    save_sites_store(&sites_path, &store)?;
+
+    let bin_root = cli_bin_root()?;
+    let php_install_dir = bin_root.join("php");
+    let mut php_config = load_php_config(&php_install_dir.join("_state.json"));
+    ensure_php_config_defaults(&mut php_config);
+    sync_local_php_installations(&php_install_dir, &mut php_config)?;
+    let fpm_port = line_port(php_config.base_port, &site.php_version);
+    let nginx_root = bin_root.join("nginx");
+    let sites_dir = resolve_sites_dir_from_php_install_dir(&php_install_dir);
+    write_nginx_site_config(
+        &nginx_root,
+        &sites_dir,
+        &site.domain,
+        &cwd,
+        fpm_port,
+        enabled,
+    )?;
+    let domains: Vec<String> = sorted_sites(&store).into_iter().map(|s| s.domain).collect();
+    let _ = reconcile_nginx_site_configs(&sites_dir, &domains);
+    sync_hosts_block(domains, &sites_dir)?;
+    let _ = reload_nginx_if_running(&nginx_root);
+
+    let log_path = resolve_logs_dir_from_bin_root(&bin_root).join("runtime.log");
+    append_runtime_log(
+        &log_path,
+        "INFO",
+        "cli.ssl",
+        &format!("Set SSL={} for {}", enabled, site.domain),
+    );
+    println!("{} SSL for {}", if enabled { "Enabled" } else { "Disabled" }, site.domain);
+    Ok(())
+}
+
+fn cli_set_php_current(line: &str) -> Result<(), String> {
+    let bin_root = cli_bin_root()?;
+    let php_install_dir = bin_root.join("php");
+    let mariadb_install_dir = bin_root.join("mariadb");
+    let config_path = php_install_dir.join("_state.json");
+    let cache_path = php_install_dir.join("_releases_cache.json");
+    let mut config = load_php_config(&config_path);
+    ensure_php_config_defaults(&mut config);
+    sync_local_php_installations(&php_install_dir, &mut config)?;
+    let installed = config.installed.get(line).cloned().unwrap_or_default();
+    if installed.is_empty() {
+        return Err(format!("php line {line} is not installed"));
+    }
+    set_php_current_link(&php_install_dir, line)?;
+    config.current_line = Some(line.to_string());
+    save_php_config(&config_path, &config)?;
+    let _ = refresh_user_path_with_runtime_currents(&php_install_dir, &mariadb_install_dir);
+    let _ = latest_builds_with_fallback(&cache_path);
+    println!("PHP current set to {line}");
+    Ok(())
+}
+
+fn cli_set_node_current(version_or_major: &str) -> Result<(), String> {
+    let catalog = build_node_catalog();
+    if !catalog.nvm_available {
+        return Err(catalog
+            .error
+            .unwrap_or_else(|| "Node runtime manager is not available".to_string()));
+    }
+    let requested = version_or_major.trim();
+    if requested.is_empty() {
+        return Err("node version is required".to_string());
+    }
+    let target = if catalog.installed_versions.iter().any(|v| v == requested) {
+        requested.to_string()
+    } else {
+        let mut matches: Vec<String> = catalog
+            .installed_versions
+            .iter()
+            .filter(|v| v == &&requested.to_string() || v.starts_with(&format!("{requested}.")))
+            .cloned()
+            .collect();
+        matches.sort_by(|a, b| compare_versions(b, a));
+        matches
+            .into_iter()
+            .next()
+            .ok_or_else(|| format!("no installed Node version matches '{requested}'"))?
+    };
+    run_nvm_command(&["use", &target])?;
+    let bin_root = cli_bin_root()?;
+    let _ = refresh_user_path_with_runtime_currents(&bin_root.join("php"), &bin_root.join("mariadb"));
+    println!("Node current set to {target}");
+    Ok(())
+}
+
+pub fn run_cli(args: &[String]) -> Result<i32, String> {
+    if args.is_empty() {
+        cli_print_usage();
+        return Ok(1);
+    }
+
+    let bin_root = cli_bin_root()?;
+    let _ = ensure_runtime_shims(&bin_root);
+
+    match args[0].as_str() {
+        "-h" | "--help" | "help" => {
+            cli_print_usage();
+            Ok(0)
+        }
+        "current" => {
+            let php_current = cli_php_current_line(&bin_root).unwrap_or_else(|| "-".to_string());
+            let mysql_current = cli_mariadb_current_line(&bin_root).unwrap_or_else(|| "-".to_string());
+            let node_current = node_current_version_light().unwrap_or_else(|| "-".to_string());
+            let nginx_current = detect_nginx_version_from_binary(&bin_root.join("nginx")).unwrap_or_else(|| "-".to_string());
+            println!("php={php_current}");
+            println!("node={node_current}");
+            println!("mysql={mysql_current}");
+            println!("nginx={nginx_current}");
+            Ok(0)
+        }
+        "list" => {
+            let runtime = args.get(1).map(|v| v.as_str()).unwrap_or("");
+            match runtime {
+                "php" => {
+                    for line in cli_php_installed_lines(&bin_root) {
+                        println!("{line}");
+                    }
+                    Ok(0)
+                }
+                "mysql" | "mariadb" => {
+                    for line in cli_mariadb_installed_lines(&bin_root) {
+                        println!("{line}");
+                    }
+                    Ok(0)
+                }
+                "node" => {
+                    let catalog = build_node_catalog();
+                    if !catalog.nvm_available {
+                        return Err(catalog
+                            .error
+                            .unwrap_or_else(|| "Node runtime manager is not available".to_string()));
+                    }
+                    for version in catalog.installed_versions {
+                        println!("{version}");
+                    }
+                    Ok(0)
+                }
+                "nginx" => {
+                    let nginx_root = bin_root.join("nginx");
+                    let mut versions: Vec<String> = Vec::new();
+                    if let Ok(entries) = fs::read_dir(&nginx_root) {
+                        for entry in entries.flatten() {
+                            let path = entry.path();
+                            if !path.is_dir() {
+                                continue;
+                            }
+                            let Some(name) = path.file_name().and_then(|v| v.to_str()) else {
+                                continue;
+                            };
+                            if name == "current" || name.starts_with('_') {
+                                continue;
+                            }
+                            if path.join("nginx.exe").exists() {
+                                versions.push(name.to_string());
+                            }
+                        }
+                    }
+                    versions.sort();
+                    for version in versions {
+                        println!("{version}");
+                    }
+                    Ok(0)
+                }
+                _ => {
+                    cli_print_usage();
+                    Ok(1)
+                }
+            }
+        }
+        "link" => {
+            let php_line = args.get(1).map(|v| v.trim()).unwrap_or("");
+            if php_line.is_empty() {
+                return Err("usage: loom link <php-line>".to_string());
+            }
+            cli_link_current_project(php_line)?;
+            Ok(0)
+        }
+        "unlink" => {
+            cli_unlink_current_project()?;
+            Ok(0)
+        }
+        "ssl" => {
+            let mode = args.get(1).map(|v| v.to_lowercase()).unwrap_or_default();
+            match mode.as_str() {
+                "on" => cli_set_ssl_for_current_project(true)?,
+                "off" => cli_set_ssl_for_current_project(false)?,
+                _ => return Err("usage: loom ssl <on|off>".to_string()),
+            }
+            Ok(0)
+        }
+        "php" => {
+            let line = args.get(1).map(|v| v.trim()).unwrap_or("");
+            if line.is_empty() {
+                return Err("usage: loom php <line>".to_string());
+            }
+            cli_set_php_current(line)?;
+            Ok(0)
+        }
+        "node" => {
+            let version = args.get(1).map(|v| v.trim()).unwrap_or("");
+            if version.is_empty() {
+                return Err("usage: loom node <version|major>".to_string());
+            }
+            cli_set_node_current(version)?;
+            Ok(0)
+        }
+        _ => {
+            cli_print_usage();
+            Ok(1)
+        }
+    }
+}
+
+pub fn run_or_cli() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 && args[1] == "--cli" {
+        let code = match run_cli(&args[2..]) {
+            Ok(code) => code,
+            Err(error) => {
+                eprintln!("{error}");
+                1
+            }
+        };
+        std::process::exit(code);
+    }
+    run();
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -5945,6 +7533,35 @@ pub fn run() {
                 }),
                 log_path,
             });
+            if let Err(error) = sync_windows_startup_setting(
+                &app
+                    .state::<AppState>()
+                    .settings
+                    .lock()
+                    .map_err(|_| "failed to lock settings state".to_string())?
+                    .config,
+            ) {
+                append_runtime_log(
+                    &app.state::<AppState>().log_path,
+                    "ERROR",
+                    "settings.startup",
+                    &error,
+                );
+            }
+            build_systray(&app.handle())?;
+            let start_minimized_arg = std::env::args().any(|arg| arg.eq_ignore_ascii_case("--minimized"));
+            if start_minimized_arg {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.minimize();
+                    let _ = window.hide();
+                }
+                append_runtime_log(
+                    &app.state::<AppState>().log_path,
+                    "INFO",
+                    "startup",
+                    "Application started minimized (--minimized)",
+                );
+            }
             let app_handle = app.handle().clone();
             std::thread::spawn(move || bootstrap_php_and_composer(app_handle));
             let update_handle = app.handle().clone();

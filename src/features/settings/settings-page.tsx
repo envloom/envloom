@@ -13,6 +13,8 @@ export function SettingsPage() {
   const [settings, setSettings] = useState<AppSettingsResponse | null>(null);
   const [autoStart, setAutoStart] = useState(true);
   const [autoUpdate, setAutoUpdate] = useState(true);
+  const [startWithWindows, setStartWithWindows] = useState(false);
+  const [startMinimized, setStartMinimized] = useState(false);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
@@ -25,6 +27,8 @@ export function SettingsPage() {
       setSettings(response);
       setAutoStart(response.autoStartServices);
       setAutoUpdate(response.autoUpdate);
+      setStartWithWindows(response.startWithWindows);
+      setStartMinimized(response.startMinimized);
     } catch (err) {
       setError(toErrorMessage(err, "Failed to load settings."));
     } finally {
@@ -36,10 +40,12 @@ export function SettingsPage() {
     setSaving(true);
     setError("");
     try {
-      const response = await setAppSettings(autoStart, autoUpdate);
+      const response = await setAppSettings(autoStart, autoUpdate, startWithWindows, startMinimized);
       setSettings(response);
       setAutoStart(response.autoStartServices);
       setAutoUpdate(response.autoUpdate);
+      setStartWithWindows(response.startWithWindows);
+      setStartMinimized(response.startMinimized);
     } catch (err) {
       setError(toErrorMessage(err, "Failed to save settings."));
     } finally {
@@ -95,6 +101,44 @@ export function SettingsPage() {
               disabled={loading || saving}
             />
             {autoUpdate ? "On" : "Off"}
+          </label>
+        </div>
+
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <p className="font-medium">Start with Windows</p>
+            <p className="text-sm text-muted-foreground">
+              Registers Envloom in your Windows startup apps (current user).
+            </p>
+          </div>
+          <label className="inline-flex cursor-pointer items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              className="size-4"
+              checked={startWithWindows}
+              onChange={(event) => setStartWithWindows(event.target.checked)}
+              disabled={loading || saving}
+            />
+            {startWithWindows ? "On" : "Off"}
+          </label>
+        </div>
+
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <p className="font-medium">Start minimized</p>
+            <p className="text-sm text-muted-foreground">
+              Starts hidden to tray when launched from the Windows startup entry.
+            </p>
+          </div>
+          <label className="inline-flex cursor-pointer items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              className="size-4"
+              checked={startMinimized}
+              onChange={(event) => setStartMinimized(event.target.checked)}
+              disabled={loading || saving}
+            />
+            {startMinimized ? "On" : "Off"}
           </label>
         </div>
 

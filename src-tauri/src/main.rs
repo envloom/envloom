@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    envloom_lib::run()
+    envloom_lib::run_or_cli()
 }

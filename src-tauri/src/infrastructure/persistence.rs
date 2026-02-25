@@ -42,6 +42,8 @@ pub(crate) fn default_app_settings() -> AppSettings {
     AppSettings {
         auto_start_services: true,
         auto_update: true,
+        start_with_windows: false,
+        start_minimized: false,
     }
 }
 

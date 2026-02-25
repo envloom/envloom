@@ -3,6 +3,8 @@ import { invoke, isTauri } from "@tauri-apps/api/core";
 export type AppSettingsResponse = {
   autoStartServices: boolean;
   autoUpdate: boolean;
+  startWithWindows: boolean;
+  startMinimized: boolean;
   configPath: string;
 };
 
@@ -11,7 +13,17 @@ export async function getAppSettings(): Promise<AppSettingsResponse> {
   return invoke<AppSettingsResponse>("settings_get");
 }
 
-export async function setAppSettings(autoStartServices: boolean, autoUpdate: boolean): Promise<AppSettingsResponse> {
+export async function setAppSettings(
+  autoStartServices: boolean,
+  autoUpdate: boolean,
+  startWithWindows: boolean,
+  startMinimized: boolean,
+): Promise<AppSettingsResponse> {
   if (!isTauri()) throw new Error("Tauri runtime not available");
-  return invoke<AppSettingsResponse>("settings_set", { autoStartServices, autoUpdate });
+  return invoke<AppSettingsResponse>("settings_set", {
+    autoStartServices,
+    autoUpdate,
+    startWithWindows,
+    startMinimized,
+  });
 }

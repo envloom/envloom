@@ -32,6 +32,10 @@
 - [x] Check de updates en background cada hora para PHP/Node/MariaDB (cache de releases 1h).
 - [x] Boton `Update` por runtime instalado cuando existe build/version mas nueva.
 - [x] Check de updates horario controlado por setting global (`autoUpdate`).
+- [x] CLI basico integrado en el mismo binario (`--cli`) con shim `loom.cmd`.
+- [x] CLI `loom current` y `loom list <runtime>`.
+- [x] CLI local por proyecto: `loom link`, `loom unlink`, `loom ssl on|off`.
+- [x] CLI cambio de current: `loom php <version>`, `loom node <version|major>`.
 
 ### 2) Bootstrap de entorno
 - [x] En primer arranque descarga PHP mas reciente con splash/progreso bloqueante.
@@ -107,6 +111,7 @@
 - [x] Integracion de `@melloware/react-logviewer` en visores de logs.
 - [x] Logs UI simplificado: sin selector de archivo ni filtro manual; solo refresh.
 - [x] Pagina Settings basica funcional (auto-start / auto-update) con datos reales.
+- [x] Settings: `Start with Windows` (HKCU Run) y `Start minimized`.
 
 ### 9) Arquitectura backend
 - [x] Refactor inicial backend: separacion por capas (`domain`, `infrastructure`, `lib` como composition root).
@@ -117,7 +122,15 @@
 
 ### 7) Systray
 - [ ] Icono con estado global (running/stopped/error).
-- [ ] Menu rapido (Start all, Stop all, Restart, versiones, logs).
+- [x] Systray base con icono y click izquierdo para abrir/enfocar ventana principal.
+- [x] Menu rapido con acciones globales (`Start all`, `Stop all`, `Reload all`, `Quit`).
+- [x] Item superior con branding + version (`Envloom vX.Y.Z`) como titulo deshabilitado.
+- [x] Submenu `Sites` (solo sitios vinculados) con apertura directa en navegador.
+- [x] Submenu `PHP` con current, `Switch version`, `Add version`, `php.ini` y accesos a `ext/logs`.
+- [x] Submenu `Nginx` con SSL masivo (`all on/off`), configs de sitios y logs globales.
+- [x] Submenu `MySQL` (MariaDB) con current, `Switch version` y `Add version`.
+- [x] Submenu `Node` con current, `Switch version` y `Add version`.
+- [x] Refresco dinamico del menu tras cambios (switch/install/start-stop/reload).
 - [ ] Notificaciones con acciones rapidas.
 
 ### 8) Logs y diagnostico
@@ -155,11 +168,12 @@
 - [x] Config global Envloom persistida en `~/.envloom/config.json`.
 - [x] Settings expuestos por backend (`settings_get`, `settings_set`).
 - [x] Compatibilidad de lectura con clave legacy `autoStart` (migracion suave a `autoStartServices`).
+- [x] Nuevas claves globales `startWithWindows` y `startMinimized`.
 
 ## v1 (muy recomendado)
-- [ ] CLI `Envloom use <runtime> <version>`.
-- [ ] CLI `Envloom current`.
-- [ ] CLI `Envloom list <runtime>`.
+- [ ] CLI `loom start|stop|reload`.
+- [ ] CLI `loom open <site>`.
+- [ ] CLI `loom logs <runtime>`.
 - [ ] Gestion de hosts locales (`project.test`, subdominios).
 - [ ] Integracion con plantillas de proyecto (Laravel, Symfony, WordPress, Node).
 
@@ -169,4 +183,4 @@
 - [ ] Sistema de plugins (Redis, PostgreSQL, Mailpit, etc).
 - [ ] Health checks y metricas basicas.
 
-codex resume 019c7cb1-17d4-7982-9c31-115d74b6ce83
+019c7cb1-17d4-7982-9c31-115d74b6ce83

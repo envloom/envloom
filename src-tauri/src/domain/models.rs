@@ -42,6 +42,10 @@ pub(crate) struct AppSettings {
     pub(crate) auto_start_services: bool,
     #[serde(rename = "autoUpdate", default = "default_true")]
     pub(crate) auto_update: bool,
+    #[serde(rename = "startWithWindows", default)]
+    pub(crate) start_with_windows: bool,
+    #[serde(rename = "startMinimized", default)]
+    pub(crate) start_minimized: bool,
 }
 
 fn default_true() -> bool {
@@ -53,6 +57,8 @@ fn default_true() -> bool {
 pub(crate) struct AppSettingsResponse {
     pub(crate) auto_start_services: bool,
     pub(crate) auto_update: bool,
+    pub(crate) start_with_windows: bool,
+    pub(crate) start_minimized: bool,
     pub(crate) config_path: String,
 }
 
