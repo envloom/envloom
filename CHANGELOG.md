@@ -7,6 +7,8 @@ and this project aims to follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-02-25
+
 ### Added
 
 - Envloom branding (Tauri app, UI, settings path, hosts block markers)
